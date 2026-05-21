@@ -2,9 +2,16 @@
 
 import { ChangeEvent, FormEvent, useState } from "react";
 
+type UploadState = "uploading" | "uploaded" | "error";
+
 type AttachedFile = {
   id: string;
-  file: File;
+  name: string;
+  size: number;
+  extension: string;
+  status: UploadState;
+  storagePath?: string;
+  error?: string;
 };
 
 const starterConversations = [
@@ -60,36 +67,133 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function getFileExtension(filename: string) {
+  return filename.split(".").pop()?.toUpperCase() ?? "FILE";
+}
+
+function getStatusLabel(file: AttachedFile) {
+  if (file.status === "uploaded") return "Uploaded";
+  if (file.status === "uploading") return "Uploading...";
+  return file.error ? `Error: ${file.error}` : "Upload failed";
+}
+
 export default function Home() {
   const [message, setMessage] = useState("");
   const [files, setFiles] = useState<AttachedFile[]>([]);
+  const [uploadMessage, setUploadMessage] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
 
-  function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+  async function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const selectedFiles = Array.from(event.target.files ?? []);
+
+    if (selectedFiles.length === 0) {
+      return;
+    }
+
+    setUploadMessage(null);
+    setIsUploading(true);
+
+    const pendingFiles = selectedFiles.map((file) => ({
+      id: `${file.name}-${file.lastModified}-${file.size}`,
+      name: file.name,
+      size: file.size,
+      extension: getFileExtension(file.name),
+      status: "uploading" as const,
+    }));
 
     setFiles((current) => {
       const next = [...current];
 
-      selectedFiles.forEach((file) => {
-        const exists = next.some(
-          (entry) =>
-            entry.file.name === file.name &&
-            entry.file.size === file.size &&
-            entry.file.lastModified === file.lastModified,
-        );
+      pendingFiles.forEach((pendingFile) => {
+        const exists = next.some((entry) => entry.id === pendingFile.id);
 
         if (!exists) {
-          next.push({
-            id: `${file.name}-${file.lastModified}-${file.size}`,
-            file,
-          });
+          next.push(pendingFile);
         }
       });
 
       return next;
     });
 
-    event.target.value = "";
+    try {
+      const formData = new FormData();
+
+      selectedFiles.forEach((file) => {
+        formData.append("files", file);
+      });
+
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        body: formData,
+      });
+
+      const payload = (await response.json()) as
+        | {
+            error?: string;
+            files?: Array<{
+              id: string;
+              originalFilename: string;
+              storagePath: string;
+              fileSizeBytes: number;
+            }>;
+          }
+        | undefined;
+
+      if (!response.ok || !payload?.files) {
+        const errorMessage = payload?.error ?? "The upload failed.";
+
+        setFiles((current) =>
+          current.map((entry) =>
+            pendingFiles.some((pending) => pending.id === entry.id)
+              ? { ...entry, status: "error", error: errorMessage }
+              : entry,
+          ),
+        );
+        setUploadMessage(errorMessage);
+        return;
+      }
+
+      setFiles((current) =>
+        current.map((entry) => {
+          const uploaded = payload.files?.find(
+            (file) =>
+              file.originalFilename === entry.name && file.fileSizeBytes === entry.size,
+          );
+
+          if (!uploaded) {
+            return entry;
+          }
+
+          return {
+            ...entry,
+            id: uploaded.id,
+            status: "uploaded",
+            storagePath: uploaded.storagePath,
+            error: undefined,
+          };
+        }),
+      );
+
+      setUploadMessage(
+        `${payload.files.length} document${payload.files.length === 1 ? "" : "s"} uploaded successfully.`,
+      );
+    } catch {
+      setFiles((current) =>
+        current.map((entry) =>
+          pendingFiles.some((pending) => pending.id === entry.id)
+            ? {
+                ...entry,
+                status: "error",
+                error: "Could not reach the upload endpoint.",
+              }
+            : entry,
+        ),
+      );
+      setUploadMessage("Could not reach the upload endpoint.");
+    } finally {
+      setIsUploading(false);
+      event.target.value = "";
+    }
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -106,7 +210,7 @@ export default function Home() {
               <span>New chat</span>
             </button>
             <button className="flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm text-zinc-300 hover:bg-white/7">
-              <span className="inline-flex w-4 justify-center">☰</span>
+              <span className="inline-flex w-4 justify-center">Lib</span>
               <span>Library</span>
             </button>
           </div>
@@ -243,12 +347,19 @@ export default function Home() {
                   <button
                     type="button"
                     className="rounded-full px-3 py-1.5 text-zinc-400 hover:bg-white/7 disabled:cursor-not-allowed disabled:opacity-50"
-                    onClick={() => setFiles([])}
+                    onClick={() => {
+                      setFiles([]);
+                      setUploadMessage(null);
+                    }}
                     disabled={files.length === 0}
                   >
                     Clear all
                   </button>
                 </div>
+
+                {uploadMessage ? (
+                  <p className="mb-3 text-sm text-zinc-300">{uploadMessage}</p>
+                ) : null}
 
                 {files.length === 0 ? (
                   <p className="text-sm text-zinc-400">
@@ -256,29 +367,32 @@ export default function Home() {
                   </p>
                 ) : (
                   <div className="flex flex-wrap gap-3">
-                    {files.map((entry) => {
-                      const extension =
-                        entry.file.name.split(".").pop()?.toUpperCase() ?? "FILE";
-
-                      return (
-                        <div
-                          key={entry.id}
-                          className="flex min-w-0 items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.05] px-3 py-2.5"
-                        >
-                          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/7 text-xs font-semibold">
-                            {extension}
-                          </div>
-                          <div className="min-w-0">
-                            <p className="max-w-[220px] truncate text-sm">
-                              {entry.file.name}
-                            </p>
-                            <p className="text-xs text-zinc-400">
-                              {formatBytes(entry.file.size)}
-                            </p>
-                          </div>
+                    {files.map((entry) => (
+                      <div
+                        key={entry.id}
+                        className="flex min-w-0 items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.05] px-3 py-2.5"
+                      >
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white/7 text-xs font-semibold">
+                          {entry.extension}
                         </div>
-                      );
-                    })}
+                        <div className="min-w-0">
+                          <p className="max-w-[220px] truncate text-sm">
+                            {entry.name}
+                          </p>
+                          <p
+                            className={`text-xs ${
+                              entry.status === "error"
+                                ? "text-rose-300"
+                                : entry.status === "uploaded"
+                                  ? "text-emerald-300"
+                                  : "text-zinc-400"
+                            }`}
+                          >
+                            {formatBytes(entry.size)} • {getStatusLabel(entry)}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -290,13 +404,14 @@ export default function Home() {
                 <div className="flex flex-wrap items-center gap-3">
                   <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-white/8 bg-white/[0.05] px-4 py-2.5 text-sm hover:bg-white/[0.08]">
                     <span className="inline-flex w-4 justify-center">+</span>
-                    <span>Add files</span>
+                    <span>{isUploading ? "Uploading..." : "Add files"}</span>
                     <input
                       type="file"
                       accept=".pdf,.doc,.docx"
                       multiple
                       className="hidden"
                       onChange={handleFiles}
+                      disabled={isUploading}
                     />
                   </label>
                   <button
@@ -324,7 +439,7 @@ export default function Home() {
                     className="inline-flex h-10 w-10 items-center justify-center self-end rounded-xl bg-white text-xl text-zinc-950 hover:opacity-90"
                     aria-label="Send message"
                   >
-                    ↑
+                    ^
                   </button>
                 </div>
               </form>

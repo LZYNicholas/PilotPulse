@@ -7,3 +7,6 @@ dist
 .env.development.local
 .env.production.local
 *.log
+__pycache__/
+*.pyc
+Pinecone pcsk_2k8w4V_2oEMxvjvNLzcmy.txt
