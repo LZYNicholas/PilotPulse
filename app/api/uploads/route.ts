@@ -17,6 +17,45 @@ function getFileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
 }
 
+export async function GET() {
+  const { data, error } = await supabaseAdmin
+    .from("cv_files")
+    .select(
+      "id, original_filename, storage_path, file_size_bytes, mime_type, upload_status, uploaded_at, candidate_name, candidate_email",
+    )
+    .is("deleted_at", null)
+    .order("uploaded_at", { ascending: false });
+
+  if (error) {
+    return NextResponse.json(
+      { error: `Failed to load CVs: ${error.message}` },
+      { status: 500 },
+    );
+  }
+
+  const files = await Promise.all(
+    data.map(async (file) => {
+      const { data: signedUrlData } = await supabaseAdmin.storage
+        .from("cv-uploads")
+        .createSignedUrl(file.storage_path, 60 * 60);
+
+      return {
+      id: file.id,
+      originalFilename: file.original_filename,
+      fileSizeBytes: file.file_size_bytes,
+      mimeType: file.mime_type,
+      uploadStatus: file.upload_status,
+      uploadedAt: file.uploaded_at,
+      candidateName: file.candidate_name,
+      candidateEmail: file.candidate_email,
+        fileUrl: signedUrlData?.signedUrl ?? null,
+      };
+    }),
+  );
+
+  return NextResponse.json({ files });
+}
+
 export async function POST(request: Request) {
   const formData = await request.formData();
   const fileEntries = formData.getAll("files");

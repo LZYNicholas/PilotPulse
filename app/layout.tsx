@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "PilotPulse",
-  description: "AI resume analyzer with document upload and grounded chat.",
+  description: "CV uploads for job seekers and recruiters.",
 };
 
 export default function RootLayout({

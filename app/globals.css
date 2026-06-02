@@ -10,6 +10,8 @@
 
 html {
   background: #212121;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -18,6 +20,7 @@ body {
   background: #212121;
   color: #ececec;
   font-family: "Aptos", "Segoe UI Variable", "Segoe UI", sans-serif;
+  overflow: hidden;
 }
 
 button,
