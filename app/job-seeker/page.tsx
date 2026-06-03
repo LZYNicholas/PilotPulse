@@ -1,6 +1,13 @@
 "use client";
 
-import { ChangeEvent, FormEvent, KeyboardEvent, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  DragEvent,
+  FormEvent,
+  KeyboardEvent,
+  useRef,
+  useState,
+} from "react";
 
 type Sender = "assistant" | "user";
 type UploadStatus = "uploading" | "uploaded" | "error";
@@ -16,6 +23,7 @@ type LocalFile = {
   name: string;
   size: number;
   status: UploadStatus;
+  fileUrl?: string | null;
   error?: string;
 };
 
@@ -26,6 +34,12 @@ const initialMessages: ChatMessage[] = [
     text: "Upload your CV, then I will ask for your name, phone number, and email.",
   },
 ];
+
+const SUPPORTED_EXTENSIONS = new Set(["pdf", "docx"]);
+const SUPPORTED_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -47,16 +61,46 @@ function makeMessage(sender: Sender, text: string): ChatMessage {
   };
 }
 
+function getFileExtension(filename: string) {
+  return filename.split(".").pop()?.toLowerCase() ?? "";
+}
+
+function isSupportedCvFile(file: File) {
+  return (
+    SUPPORTED_EXTENSIONS.has(getFileExtension(file.name)) &&
+    SUPPORTED_MIME_TYPES.has(file.type)
+  );
+}
+
+function hasUnsupportedDraggedFiles(event: DragEvent<HTMLElement>) {
+  return Array.from(event.dataTransfer.items).some((item) => {
+    if (item.kind !== "file") return false;
+
+    const extension = getFileExtension(item.getAsFile()?.name ?? "");
+    return !SUPPORTED_MIME_TYPES.has(item.type) && !SUPPORTED_EXTENSIONS.has(extension);
+  });
+}
+
 export default function JobSeekerChat() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [prompt, setPrompt] = useState("");
   const [localFiles, setLocalFiles] = useState<LocalFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
 
-  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
-    const selectedFiles = Array.from(event.target.files ?? []);
+  async function uploadFiles(selectedFiles: File[]) {
     if (selectedFiles.length === 0) return;
+
+    const unsupportedFiles = selectedFiles.filter((file) => !isSupportedCvFile(file));
+
+    if (unsupportedFiles.length > 0) {
+      setMessages((current) => [
+        ...current,
+        makeMessage("assistant", "Only PDF and DOCX files can be uploaded."),
+      ]);
+      return;
+    }
 
     const pendingFiles = selectedFiles.map((file) => ({
       id: `${file.name}-${file.lastModified}-${file.size}`,
@@ -91,6 +135,7 @@ export default function JobSeekerChat() {
               id: string;
               originalFilename: string;
               fileSizeBytes: number;
+              fileUrl: string | null;
             }>;
           }
         | undefined;
@@ -126,6 +171,7 @@ export default function JobSeekerChat() {
             ...file,
             id: uploadedFile.id,
             status: "uploaded",
+            fileUrl: uploadedFile.fileUrl,
             error: undefined,
           };
         }),
@@ -151,8 +197,12 @@ export default function JobSeekerChat() {
       ]);
     } finally {
       setIsUploading(false);
-      event.target.value = "";
     }
+  }
+
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
+    await uploadFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
   }
 
   function submitMessage(event: FormEvent<HTMLFormElement>) {
@@ -175,8 +225,59 @@ export default function JobSeekerChat() {
     event.currentTarget.form?.requestSubmit();
   }
 
+  function handleDragEnter(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setIsDraggingFile(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = hasUnsupportedDraggedFiles(event) ? "none" : "copy";
+    setIsDraggingFile(true);
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsDraggingFile(false);
+    }
+  }
+
+  async function handleDrop(event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setIsDraggingFile(false);
+
+    const droppedFiles = Array.from(event.dataTransfer.files);
+
+    if (droppedFiles.length === 0) return;
+
+    if (droppedFiles.some((file) => !isSupportedCvFile(file))) {
+      setMessages((current) => [
+        ...current,
+        makeMessage("assistant", "Only PDF and DOCX files can be uploaded."),
+      ]);
+      return;
+    }
+
+    await uploadFiles(droppedFiles);
+  }
+
   return (
-    <main className="flex h-screen overflow-hidden bg-[#212121] text-[#ececec]">
+    <main
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className={`relative flex h-screen overflow-hidden bg-[#212121] text-[#ececec] ${
+        isDraggingFile ? "outline outline-2 outline-inset outline-[#10a37f]" : ""
+      }`}
+    >
+      {isDraggingFile ? (
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-[#212121]/75">
+          <div className="rounded-2xl border border-[#10a37f] bg-[#283f39] px-6 py-4 text-sm font-medium text-white shadow-2xl">
+            Drop PDF or DOCX to upload
+          </div>
+        </div>
+      ) : null}
       <aside className="hidden w-[260px] shrink-0 flex-col border-r border-white/10 bg-[#171717] p-3 md:flex">
         <div className="px-3 py-2 text-sm font-semibold">PilotPulse</div>
         <div className="mt-4 rounded-lg bg-white/10 px-3 py-2 text-sm text-white">
@@ -187,9 +288,21 @@ export default function JobSeekerChat() {
             <p>No CV uploaded yet.</p>
           ) : (
             localFiles.slice(0, 6).map((file) => (
-              <div key={file.id} className="truncate">
-                {file.name} / {statusText(file)}
-              </div>
+              <a
+                key={file.id}
+                href={file.fileUrl ?? undefined}
+                target="_blank"
+                rel="noreferrer"
+                aria-disabled={!file.fileUrl}
+                className={`block truncate rounded-md bg-white/5 p-2 ${
+                  file.fileUrl ? "hover:bg-white/10" : "cursor-default"
+                }`}
+              >
+                <span className="block truncate text-zinc-200">{file.name}</span>
+                <span className="block truncate">
+                  {formatBytes(file.size)} / {statusText(file)}
+                </span>
+              </a>
             ))
           )}
         </div>
@@ -246,7 +359,7 @@ export default function JobSeekerChat() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.doc,.docx"
+              accept=".pdf,.docx"
               className="hidden"
               onChange={handleUpload}
               disabled={isUploading}

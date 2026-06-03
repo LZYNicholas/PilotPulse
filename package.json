@@ -9,10 +9,12 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.49.8",
+    "mammoth": "^1.12.0",
     "next": "latest",
+    "pdf-parse": "^1.1.1",
     "react": "latest",
-    "react-dom": "latest",
-    "@supabase/supabase-js": "^2.49.8"
+    "react-dom": "latest"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "latest",
