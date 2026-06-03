@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 const SYSTEM_PROMPT = `You are a friendly onboarding assistant for PilotPulse, a recruitment platform.
 
@@ -59,33 +60,38 @@ export async function POST(request: Request) {
     );
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
     return NextResponse.json(
-      { error: "Anthropic API key is not configured." },
+      { error: "Gemini API key is not configured." },
       { status: 500 },
     );
   }
 
-  const response = await fetch(ANTHROPIC_API_URL, {
+  const response = await fetch(GEMINI_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+      "x-goog-api-key": apiKey,
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 512,
-      system: SYSTEM_PROMPT,
-      messages,
+      systemInstruction: {
+        parts: [{ text: SYSTEM_PROMPT }],
+      },
+      contents: messages.map((message) => ({
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [{ text: message.content }],
+      })),
+      generationConfig: {
+        maxOutputTokens: 512,
+      },
     }),
   });
 
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error("Anthropic API error:", errorBody);
+    console.error("Gemini API error:", errorBody);
     return NextResponse.json(
       { error: "Failed to get a response from the AI." },
       { status: 502 },
@@ -93,11 +99,18 @@ export async function POST(request: Request) {
   }
 
   const data = (await response.json()) as {
-    content: Array<{ type: string; text: string }>;
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ text?: string }>;
+      };
+    }>;
   };
 
   const rawText =
-    data.content.find((block) => block.type === "text")?.text ?? "";
+    data.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text ?? "")
+      .join("")
+      .trim() ?? "";
 
   // Check if AI is ready to save (user confirmed details)
   if (rawText.startsWith("SAVE_DETAILS")) {
@@ -149,9 +162,9 @@ function parseContactBlock(text: string): ContactDetails {
 function formatConfirmMessage(details: ContactDetails): string {
   return [
     "Just to confirm, here are the details I have:",
-    `• Name: ${details.name ?? "—"}`,
-    `• Phone: ${details.phone ?? "—"}`,
-    `• Email: ${details.email ?? "—"}`,
+    `- Name: ${details.name ?? "-"}`,
+    `- Phone: ${details.phone ?? "-"}`,
+    `- Email: ${details.email ?? "-"}`,
     "",
     "Does that look correct? Reply yes to save, or let me know what to fix.",
   ].join("\n");
