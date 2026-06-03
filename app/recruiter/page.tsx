@@ -57,6 +57,7 @@ export default function RecruiterChat() {
   const [prompt, setPrompt] = useState("");
   const [files, setFiles] = useState<RecruiterFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [isReplying, setIsReplying] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [showAllFiles, setShowAllFiles] = useState(false);
 
@@ -83,22 +84,58 @@ export default function RecruiterChat() {
     }
   }
 
-  function submitMessage(event: FormEvent<HTMLFormElement>) {
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = prompt.trim();
-    if (!text) return;
+    if (!text || isReplying) return;
 
-    setMessages((current) => [
-      ...current,
-      makeMessage("user", text),
-      makeMessage(
-        "assistant",
-        `I will answer using ${files.length} uploaded CV${
-          files.length === 1 ? "" : "s"
-        } in the knowledge base.`,
-      ),
-    ]);
+    const userMessage = makeMessage("user", text);
+
+    setMessages((current) => [...current, userMessage]);
     setPrompt("");
+    setIsReplying(true);
+
+    try {
+      const response = await fetch("/api/recruiter-chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          question: text,
+          messages: [...messages, userMessage].map((message) => ({
+            role: message.sender === "assistant" ? "assistant" : "user",
+            content: message.text,
+          })),
+        }),
+      });
+
+      const payload = (await response.json()) as
+        | { reply?: string; error?: string }
+        | undefined;
+
+      const reply = payload?.reply;
+
+      if (!response.ok || !reply) {
+        setMessages((current) => [
+          ...current,
+          makeMessage(
+            "assistant",
+            payload?.error ?? "I could not answer from the CV knowledge base.",
+          ),
+        ]);
+        return;
+      }
+
+      setMessages((current) => [...current, makeMessage("assistant", reply)]);
+    } catch {
+      setMessages((current) => [
+        ...current,
+        makeMessage("assistant", "Could not reach the recruiter chat endpoint."),
+      ]);
+    } finally {
+      setIsReplying(false);
+    }
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -225,6 +262,16 @@ export default function RecruiterChat() {
                 </div>
               </article>
             ))}
+            {isReplying ? (
+              <article className="flex justify-start gap-4">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#10a37f] text-xs font-semibold text-white">
+                  PP
+                </div>
+                <div className="max-w-[78%] rounded-2xl px-4 py-3 text-sm leading-6 text-zinc-400">
+                  Thinking...
+                </div>
+              </article>
+            ) : null}
           </div>
         </div>
 
@@ -243,7 +290,8 @@ export default function RecruiterChat() {
             />
             <button
               type="submit"
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-lg font-semibold text-[#212121] hover:bg-zinc-200"
+              disabled={isReplying}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-lg font-semibold text-[#212121] hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
               aria-label="Send message"
               title="Send"
             >
