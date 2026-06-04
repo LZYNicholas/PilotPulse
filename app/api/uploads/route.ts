@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 
 import { chunkCvText } from "@/lib/cv/chunk";
 import { extractCvText } from "@/lib/cv/extract";
+import { indexCvChunks } from "@/lib/rag/indexChunks";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
@@ -178,25 +179,38 @@ export async function POST(request: Request) {
 
       const chunks = chunkCvText(extractedText, fileId);
       chunkCount = chunks.length;
+      const chunkRows = chunks.map((chunk) => ({
+        id: randomUUID(),
+        cv_file_id: fileId,
+        chunk_index: chunk.chunkIndex,
+        chunk_text: chunk.chunkText,
+        token_count: chunk.tokenCount,
+        char_count: chunk.charCount,
+        pinecone_vector_id: chunk.pineconeVectorId,
+      }));
 
-      if (chunks.length > 0) {
+      if (chunkRows.length > 0) {
         const { error: chunkInsertError } = await supabaseAdmin
           .from("cv_chunks")
-          .insert(
-            chunks.map((chunk) => ({
-              id: randomUUID(),
-              cv_file_id: fileId,
-              chunk_index: chunk.chunkIndex,
-              chunk_text: chunk.chunkText,
-              token_count: chunk.tokenCount,
-              char_count: chunk.charCount,
-              pinecone_vector_id: chunk.pineconeVectorId,
-            })),
-          );
+          .insert(chunkRows);
 
         if (chunkInsertError) {
           throw new Error(`Failed to save CV chunks: ${chunkInsertError.message}`);
         }
+
+        await indexCvChunks({
+          cvFile: {
+            id: fileId,
+            originalFilename: file.name,
+          },
+          chunks: chunkRows.map((chunk) => ({
+            id: chunk.id,
+            cvFileId: chunk.cv_file_id,
+            chunkIndex: chunk.chunk_index,
+            chunkText: chunk.chunk_text,
+            pineconeVectorId: chunk.pinecone_vector_id,
+          })),
+        });
       }
 
       const { error: readyUpdateError } = await supabaseAdmin

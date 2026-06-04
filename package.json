@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "index:chunks": "node scripts/index-existing-chunks.mjs",
     "lint": "eslint ."
   },
   "dependencies": {
