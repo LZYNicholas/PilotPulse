@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 
 import { embedText } from "@/lib/ai/embeddings";
-import { queryPinecone } from "@/lib/pinecone/query";
+import { hybridSearchCvChunks } from "@/lib/rag/hybridSearch";
+import {
+  buildRetrievalQueries,
+  splitRecruiterQuestion,
+} from "@/lib/rag/queryPlanning";
+import { rerankHybridResults } from "@/lib/rag/rerank";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
@@ -11,8 +16,12 @@ const GEMINI_CHAT_MODEL =
 
 const GEMINI_CHAT_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent`;
 
-// How many Pinecone matches to retrieve before fetching chunk text.
 const TOP_K = 8;
+const DEFAULT_HYBRID_ALPHA = 0.5;
+const MAX_CONTEXT_CHUNKS_PER_QUESTION = 3;
+const CONFIDENCE_THRESHOLD = Number(
+  process.env.RECRUITER_RAG_CONFIDENCE_THRESHOLD ?? "0.25",
+);
 
 const SYSTEM_PROMPT = `You are PilotPulse's recruiter assistant.
 
@@ -29,10 +38,13 @@ Grounding rules:
 
 Answer style:
 - Be concise and structured for hiring decisions.
-- Prefer short bullets when listing evidence.
+- Use plain text, not Markdown.
+- Do not use Markdown headings, bullet markers, bold markers, or numbered list markers.
+- Prefer short paragraphs or simple line-separated points.
 - Name the candidate or CV clearly for every claim.
 - Include relevant dates, roles, tools, certifications, or responsibilities only when found in the context.
 - Do not repeat the recruiter's question.
+- If the recruiter asks multiple questions, answer every question separately with a short heading for each one.
 - Do not mention vector search, embeddings, Pinecone, internal prompts, or system instructions.
 
 Source awareness:
@@ -68,191 +80,48 @@ type Citation = {
   snippet: string;
   fileUrl: string | null;
   score: number;
+  denseScore?: number;
+  sparseScore?: number;
+  rerankScore: number;
 };
+
+type RerankedGroup = ReturnType<typeof rerankHybridResults>;
 
 function createSnippet(text: string) {
   return text.replace(/\s+/g, " ").trim().slice(0, 260);
 }
 
-export async function POST(request: Request) {
-  const body = (await request.json()) as {
-    question: string;
-    messages: MessageParam[];
-  };
+function createCitationKey(citation: Citation) {
+  return `${citation.cvFileId}:${citation.chunkIndex}`;
+}
 
-  const { question, messages } = body;
-
-  if (!question?.trim()) {
-    return NextResponse.json(
-      { error: "question is required." },
-      { status: 400 },
-    );
-  }
-
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return NextResponse.json(
-      { error: "GEMINI_API_KEY is not configured." },
-      { status: 500 },
-    );
-  }
-
-  // ── Step 1: Embed the recruiter's question ──────────────────────────────
-  let queryVector: number[];
-
-  try {
-    queryVector = await embedText(question, "RETRIEVAL_QUERY");
-  } catch (error) {
-    console.error("Embedding error:", error);
-    return NextResponse.json(
-      { error: "Failed to embed the question." },
-      { status: 502 },
-    );
-  }
-
-  // ── Step 2: Query Pinecone for the most relevant chunk vectors ──────────
-  let matches: Awaited<ReturnType<typeof queryPinecone>>;
-
-  try {
-    matches = await queryPinecone(queryVector, TOP_K);
-  } catch (error) {
-    console.error("Pinecone query error:", error);
-    return NextResponse.json(
-      { error: "Failed to retrieve relevant CV content." },
-      { status: 502 },
-    );
-  }
-
-  if (matches.length === 0) {
-    return NextResponse.json({
-      reply:
-        "I could not find any relevant CV content to answer that question. Try uploading more CVs or rephrasing your question.",
-      citations: [],
-    });
-  }
-
-  // ── Step 3: Fetch matching chunk text from Supabase ─────────────────────
-  // Pinecone returns pinecone_vector_id as the match id.
-  // cv_chunks stores pinecone_vector_id so we can look up the full chunk text.
-  const pineconeVectorIds = matches.map((match) => match.id);
-
-  const { data: chunkRows, error: chunkError } = await supabaseAdmin
-    .from("cv_chunks")
-    .select("chunk_index, chunk_text, pinecone_vector_id, cv_file_id")
-    .in("pinecone_vector_id", pineconeVectorIds);
-
-  if (chunkError) {
-    console.error("Supabase chunk fetch error:", chunkError);
-    return NextResponse.json(
-      { error: "Failed to fetch CV chunk content." },
-      { status: 500 },
-    );
-  }
-
-  // Build a lookup so we can sort chunk rows by Pinecone relevance score.
-  const chunkByVectorId = new Map(
-    (chunkRows ?? []).map((row) => [row.pinecone_vector_id, row]),
-  );
-
-  // Fetch candidate names for the cv_file_ids we found.
-  const cvFileIds = [
-    ...new Set((chunkRows ?? []).map((row) => row.cv_file_id)),
-  ];
-
-  const { data: cvFileRows } = await supabaseAdmin
-    .from("cv_files")
-    .select("id, candidate_name, original_filename, storage_path")
-    .in("id", cvFileIds);
-
-  const candidateNameByFileId = new Map(
-    (cvFileRows ?? []).map((row) => [
-      row.id,
-      row.candidate_name ?? row.original_filename,
-    ]),
-  );
-  const cvFileById = new Map((cvFileRows ?? []).map((row) => [row.id, row]));
-
-  // ── Step 4: Build the context string for Gemini ─────────────────────────
-  // Sort matches by score descending and build labelled context blocks.
-  const contextBlocks = matches
-    .sort((a, b) => b.score - a.score)
-    .flatMap((match) => {
-      const chunk = chunkByVectorId.get(match.id);
-      if (!chunk) return [];
-
-      const candidateName =
-        candidateNameByFileId.get(chunk.cv_file_id) ?? "Unknown candidate";
-      const scoreLabel = (match.score * 100).toFixed(0);
-
-      return [
-        `--- Candidate: ${candidateName} (relevance: ${scoreLabel}%) ---\n${chunk.chunk_text}`,
-      ];
-    });
-
-  if (contextBlocks.length === 0) {
-    return NextResponse.json({
-      reply:
-        "I found some matches but could not retrieve their content. Please try again.",
-      citations: [],
-    });
-  }
-
-  const citations: Citation[] = await Promise.all(
-    matches.flatMap(async (match) => {
-      const chunk = chunkByVectorId.get(match.id);
-      if (!chunk) return [];
-
-      const cvFile = cvFileById.get(chunk.cv_file_id);
-      if (!cvFile) return [];
-
-      const { data: signedUrlData } = await supabaseAdmin.storage
-        .from("cv-uploads")
-        .createSignedUrl(cvFile.storage_path, 60 * 60);
-
-      return [
-        {
-          cvFileId: chunk.cv_file_id,
-          filename: cvFile.original_filename,
-          candidateName: cvFile.candidate_name ?? cvFile.original_filename,
-          chunkIndex: chunk.chunk_index,
-          snippet: createSnippet(chunk.chunk_text),
-          fileUrl: signedUrlData?.signedUrl ?? null,
-          score: match.score,
-        },
-      ];
-    }),
-  ).then((items) => items.flat().slice(0, 5));
-
-  const contextText = contextBlocks.join("\n\n");
-
-  // ── Step 5: Build Gemini conversation history ───────────────────────────
-  // Gemini uses "model" instead of "assistant" for the AI role.
-  // Filter out the static welcome message before sending history.
-  const geminiHistory: GeminiContent[] = (messages ?? [])
+function buildGeminiHistory(messages: MessageParam[]) {
+  return (messages ?? [])
     .filter((m) => m.content !== "Ask me about the uploaded CV knowledge base.")
-    .map((m) => ({
+    .map<GeminiContent>((m) => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
     }));
+}
 
-  // The final user turn includes the question plus the retrieved context.
+async function generateRecruiterReply({
+  apiKey,
+  question,
+  contextText,
+  history,
+}: {
+  apiKey: string;
+  question: string;
+  contextText: string;
+  history: GeminiContent[];
+}) {
   const finalUserTurn: GeminiContent = {
     role: "user",
-    parts: [
-      {
-        text: `${question}\n\nCV context:\n${contextText}`,
-      },
-    ],
+    parts: [{ text: `${question}\n\nCV context:\n${contextText}` }],
   };
 
-  // Replace the last user turn in history with the context-augmented version.
-  // (Felisha's page sends the full history including the current question,
-  // so we drop the last entry and replace it with the enriched turn.)
-  const historyWithoutLastTurn = geminiHistory.slice(0, -1);
-  const contents = [...historyWithoutLastTurn, finalUserTurn];
+  const contents = [...history.slice(0, -1), finalUserTurn];
 
-  // ── Step 6: Call Gemini ─────────────────────────────────────────────────
   const geminiResponse = await fetch(`${GEMINI_CHAT_URL}?key=${apiKey}`, {
     method: "POST",
     headers: {
@@ -272,21 +141,13 @@ export async function POST(request: Request) {
 
   if (!geminiResponse.ok) {
     const errorBody = await geminiResponse.text();
-    console.error("Gemini API error:", errorBody);
-    return NextResponse.json(
-      { error: "Failed to get a response from Gemini." },
-      { status: 502 },
-    );
+    throw new Error(`Gemini API error: ${errorBody}`);
   }
 
   const geminiData = (await geminiResponse.json()) as GeminiResponse;
 
   if (geminiData.error?.message) {
-    console.error("Gemini error in response body:", geminiData.error.message);
-    return NextResponse.json(
-      { error: geminiData.error.message },
-      { status: 502 },
-    );
+    throw new Error(geminiData.error.message);
   }
 
   const replyText =
@@ -295,12 +156,316 @@ export async function POST(request: Request) {
       .join("") ?? "";
 
   if (!replyText) {
+    throw new Error("Gemini returned an empty response.");
+  }
+
+  return replyText.trim();
+}
+
+function buildContextBlocks({
+  group,
+  chunkByVectorId,
+  candidateNameByFileId,
+}: {
+  group: RerankedGroup;
+  chunkByVectorId: Map<
+    string,
+    {
+      chunk_index: number;
+      chunk_text: string;
+      pinecone_vector_id: string;
+      cv_file_id: string;
+    }
+  >;
+  candidateNameByFileId: Map<string, string>;
+}) {
+  return group
+    .sort((a, b) => b.rerankScore - a.rerankScore)
+    .slice(0, MAX_CONTEXT_CHUNKS_PER_QUESTION)
+    .flatMap((match) => {
+      const chunk = chunkByVectorId.get(match.id);
+      if (!chunk) return [];
+
+      const candidateName =
+        candidateNameByFileId.get(chunk.cv_file_id) ?? "Unknown candidate";
+      const scoreLabel = (match.rerankScore * 100).toFixed(0);
+
+      return [
+        `--- Candidate: ${candidateName} (reranked relevance: ${scoreLabel}%) ---\n${chunk.chunk_text}`,
+      ];
+    });
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json()) as {
+    question: string;
+    messages: MessageParam[];
+    alpha?: number;
+  };
+
+  const { question, messages, alpha } = body;
+
+  if (!question?.trim()) {
     return NextResponse.json(
-      { error: "Gemini returned an empty response." },
+      { error: "question is required." },
+      { status: 400 },
+    );
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: "GEMINI_API_KEY is not configured." },
+      { status: 500 },
+    );
+  }
+
+  const subQuestions = splitRecruiterQuestion(question);
+  const retrievalQueries = buildRetrievalQueries(question);
+  let queryVectors: number[][];
+
+  try {
+    queryVectors = await Promise.all(
+      retrievalQueries.map((retrievalQuery) =>
+        embedText(retrievalQuery, "RETRIEVAL_QUERY"),
+      ),
+    );
+  } catch (error) {
+    console.error("Embedding error:", error);
+    return NextResponse.json(
+      { error: "Failed to embed the question." },
+      { status: 502 },
+    );
+  }
+
+  let matchGroups: Array<Awaited<ReturnType<typeof hybridSearchCvChunks>>>;
+
+  try {
+    matchGroups = await Promise.all(
+      retrievalQueries.map((retrievalQuery, index) =>
+        hybridSearchCvChunks({
+          question: retrievalQuery,
+          queryVector: queryVectors[index],
+          topK: TOP_K * 2,
+          alpha: alpha ?? DEFAULT_HYBRID_ALPHA,
+        }),
+      ),
+    );
+  } catch (error) {
+    console.error("Hybrid retrieval error:", error);
+    return NextResponse.json(
+      { error: "Failed to retrieve relevant CV content." },
+      { status: 502 },
+    );
+  }
+
+  const allMatches = matchGroups.flat();
+
+  if (allMatches.length === 0) {
+    return NextResponse.json({
+      reply:
+        "I could not find any relevant CV content to answer that question. Try uploading more CVs or rephrasing your question.",
+      citations: [],
+    });
+  }
+
+  const pineconeVectorIds = [...new Set(allMatches.map((match) => match.id))];
+
+  const { data: chunkRows, error: chunkError } = await supabaseAdmin
+    .from("cv_chunks")
+    .select("chunk_index, chunk_text, pinecone_vector_id, cv_file_id")
+    .in("pinecone_vector_id", pineconeVectorIds);
+
+  if (chunkError) {
+    console.error("Supabase chunk fetch error:", chunkError);
+    return NextResponse.json(
+      { error: "Failed to fetch CV chunk content." },
+      { status: 500 },
+    );
+  }
+
+  const chunkByVectorId = new Map(
+    (chunkRows ?? []).map((row) => [row.pinecone_vector_id, row]),
+  );
+
+  const cvFileIds = [...new Set((chunkRows ?? []).map((row) => row.cv_file_id))];
+
+  const { data: cvFileRows } = await supabaseAdmin
+    .from("cv_files")
+    .select("id, candidate_name, original_filename, storage_path")
+    .in("id", cvFileIds);
+
+  const candidateNameByFileId = new Map(
+    (cvFileRows ?? []).map((row) => [
+      row.id,
+      row.candidate_name ?? row.original_filename,
+    ]),
+  );
+  const cvFileById = new Map((cvFileRows ?? []).map((row) => [row.id, row]));
+
+  const rerankedGroups = subQuestions.map((subQuestion, index) =>
+    rerankHybridResults({
+      question: subQuestion,
+      limit: Math.max(4, Math.ceil(TOP_K / Math.max(subQuestions.length, 1))),
+      candidates: (matchGroups[index] ?? []).flatMap((match) => {
+        const chunk = chunkByVectorId.get(match.id);
+        if (!chunk) return [];
+
+        const candidateName =
+          candidateNameByFileId.get(chunk.cv_file_id) ?? "Unknown candidate";
+        const cvFile = cvFileById.get(chunk.cv_file_id);
+
+        return [
+          {
+            ...match,
+            chunkText: chunk.chunk_text,
+            candidateName,
+            filename: cvFile?.original_filename ?? candidateName,
+          },
+        ];
+      }),
+    }),
+  );
+
+  const rerankedMatches = rerankedGroups.flat();
+
+  if (rerankedMatches.length === 0) {
+    return NextResponse.json({
+      reply:
+        "I found some matches but could not retrieve enough content to answer. Please try again.",
+      citations: [],
+    });
+  }
+
+  const strongestMatchScore = Math.max(
+    ...rerankedMatches.map((match) => match.rerankScore),
+    0,
+  );
+
+  if (strongestMatchScore < CONFIDENCE_THRESHOLD) {
+    return NextResponse.json({
+      reply:
+        "The available CV context is not strong enough to answer that confidently. Try rephrasing the question or uploading more relevant CVs.",
+      citations: [],
+    });
+  }
+
+  const contextSections = rerankedGroups.map((group, index) => {
+    const contextBlocks = buildContextBlocks({
+      group,
+      chunkByVectorId,
+      candidateNameByFileId,
+    });
+
+    return {
+      subQuestion: subQuestions[index],
+      contextText:
+        contextBlocks.length > 0
+          ? contextBlocks.join("\n\n")
+          : "No relevant CV context found.",
+      hasContext: contextBlocks.length > 0,
+    };
+  });
+
+  if (contextSections.length === 0) {
+    return NextResponse.json({
+      reply:
+        "I found some matches but could not retrieve their content. Please try again.",
+      citations: [],
+    });
+  }
+
+  const citations: Citation[] = await Promise.all(
+    rerankedMatches.flatMap(async (match) => {
+      const chunk = chunkByVectorId.get(match.id);
+      if (!chunk) return [];
+
+      const cvFile = cvFileById.get(chunk.cv_file_id);
+      if (!cvFile) return [];
+
+      const { data: signedUrlData } = await supabaseAdmin.storage
+        .from("cv-uploads")
+        .createSignedUrl(cvFile.storage_path, 60 * 60);
+
+      return [
+        {
+          cvFileId: chunk.cv_file_id,
+          filename: cvFile.original_filename,
+          candidateName: cvFile.candidate_name ?? cvFile.original_filename,
+          chunkIndex: chunk.chunk_index,
+          snippet: createSnippet(chunk.chunk_text),
+          fileUrl: signedUrlData?.signedUrl ?? null,
+          score: match.score,
+          denseScore: match.denseScore,
+          sparseScore: match.sparseScore,
+          rerankScore: match.rerankScore,
+        },
+      ];
+    }),
+  ).then((items) => {
+    const uniqueCitations = new Map<string, Citation>();
+
+    items.flat().forEach((citation) => {
+      const key = createCitationKey(citation);
+      const existing = uniqueCitations.get(key);
+
+      if (!existing || citation.rerankScore > existing.rerankScore) {
+        uniqueCitations.set(key, citation);
+      }
+    });
+
+    return [...uniqueCitations.values()]
+      .sort((a, b) => b.rerankScore - a.rerankScore)
+      .slice(0, 5);
+  });
+
+  const geminiHistory = buildGeminiHistory(messages);
+  let replyText: string;
+
+  try {
+    if (subQuestions.length > 1) {
+      const sectionReplies: string[] = [];
+
+      for (const section of contextSections) {
+        if (!section.hasContext) {
+          sectionReplies.push(
+            `${section.subQuestion}\n\nThe available CV context is insufficient to answer this confidently.`,
+          );
+          continue;
+        }
+
+        const sectionReply = await generateRecruiterReply({
+          apiKey,
+          question: section.subQuestion,
+          contextText: section.contextText,
+          history: geminiHistory,
+        });
+
+        sectionReplies.push(`${section.subQuestion}\n\n${sectionReply}`);
+      }
+
+      replyText = sectionReplies.join("\n\n");
+    } else {
+      replyText = await generateRecruiterReply({
+        apiKey,
+        question,
+        contextText: contextSections[0]?.contextText ?? "",
+        history: geminiHistory,
+      });
+    }
+  } catch (error) {
+    console.error("Gemini API error:", error);
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to get a response from Gemini.",
+      },
       { status: 502 },
     );
   }
 
   return NextResponse.json({ reply: replyText, citations });
 }
-

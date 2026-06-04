@@ -1,4 +1,5 @@
 import { embedText } from "@/lib/ai/embeddings";
+import { embedSparseText } from "@/lib/pinecone/inference";
 import { upsertPineconeVectors } from "@/lib/pinecone/client";
 
 export type ChunkForIndexing = {
@@ -35,19 +36,27 @@ export async function indexCvChunks({ chunks, cvFile }: IndexCvChunksInput) {
   if (chunks.length === 0) return { upsertedCount: 0 };
 
   const vectors = await Promise.all(
-    chunks.map(async (chunk) => ({
-      id: chunk.pineconeVectorId,
-      values: await embedText(chunk.chunkText, "RETRIEVAL_DOCUMENT"),
-      metadata: compactMetadata({
-        cv_file_id: chunk.cvFileId,
-        cv_chunk_id: chunk.id ?? null,
-        chunk_index: chunk.chunkIndex,
-        original_filename: cvFile.originalFilename,
-        candidate_name: cvFile.candidateName ?? null,
-        candidate_email: cvFile.candidateEmail ?? null,
-        snippet: createSnippet(chunk.chunkText),
-      }),
-    })),
+    chunks.map(async (chunk) => {
+      const [denseValues, sparseValues] = await Promise.all([
+        embedText(chunk.chunkText, "RETRIEVAL_DOCUMENT"),
+        embedSparseText(chunk.chunkText, "passage"),
+      ]);
+
+      return {
+        id: chunk.pineconeVectorId,
+        values: denseValues,
+        sparse_values: sparseValues,
+        metadata: compactMetadata({
+          cv_file_id: chunk.cvFileId,
+          cv_chunk_id: chunk.id ?? null,
+          chunk_index: chunk.chunkIndex,
+          original_filename: cvFile.originalFilename,
+          candidate_name: cvFile.candidateName ?? null,
+          candidate_email: cvFile.candidateEmail ?? null,
+          snippet: createSnippet(chunk.chunkText),
+        }),
+      };
+    }),
   );
 
   return upsertPineconeVectors(vectors);

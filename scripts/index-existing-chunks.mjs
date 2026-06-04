@@ -26,6 +26,8 @@ const GEMINI_EMBEDDING_DIMENSION = Number(
   process.env.GEMINI_EMBEDDING_DIMENSION ?? "1024",
 );
 const PINECONE_API_VERSION = "2025-10";
+const PINECONE_SPARSE_MODEL =
+  process.env.PINECONE_SPARSE_MODEL ?? "pinecone-sparse-english-v0";
 const PINECONE_NAMESPACE = process.env.PINECONE_NAMESPACE ?? "cv_chunks";
 const BATCH_SIZE = Number(process.env.INDEX_CHUNK_BATCH_SIZE ?? "20");
 
@@ -90,6 +92,45 @@ async function describePineconeIndex() {
   return response.json();
 }
 
+async function embedSparseText(text, inputType) {
+  const response = await fetch("https://api.pinecone.io/embed", {
+    method: "POST",
+    headers: {
+      "Api-Key": requireEnv("PINECONE_API_KEY"),
+      "Content-Type": "application/json",
+      "X-Pinecone-Api-Version": PINECONE_API_VERSION,
+    },
+    body: JSON.stringify({
+      model: PINECONE_SPARSE_MODEL,
+      inputs: [{ text }],
+      parameters: {
+        input_type: inputType,
+        truncate: "END",
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Pinecone sparse embedding failed: ${await response.text()}`,
+    );
+  }
+
+  const data = await response.json();
+  const embedding = data.data?.[0];
+
+  if (!embedding?.sparse_indices?.length || !embedding?.sparse_values?.length) {
+    throw new Error(
+      "Pinecone sparse embedding response did not include sparse values.",
+    );
+  }
+
+  return {
+    indices: embedding.sparse_indices,
+    values: embedding.sparse_values,
+  };
+}
+
 async function upsertVectors(indexHost, vectors) {
   const response = await fetch(`https://${indexHost}/vectors/upsert`, {
     method: "POST",
@@ -147,6 +188,12 @@ async function main() {
     );
   }
 
+  if (String(index.metric).toLowerCase() !== "dotproduct") {
+    throw new Error(
+      `Pinecone index ${index.name} uses metric ${index.metric}. Hybrid sparse+dense indexing requires dotproduct.`,
+    );
+  }
+
   const { data: chunks, error: chunksError } = await supabase
     .from("cv_chunks")
     .select("id, cv_file_id, chunk_index, chunk_text, pinecone_vector_id")
@@ -175,10 +222,15 @@ async function main() {
     const vectors = await Promise.all(
       batch.map(async (chunk) => {
         const cvFile = cvFileById.get(chunk.cv_file_id);
+        const [denseValues, sparseValues] = await Promise.all([
+          embedText(chunk.chunk_text),
+          embedSparseText(chunk.chunk_text, "passage"),
+        ]);
 
         return {
           id: chunk.pinecone_vector_id,
-          values: await embedText(chunk.chunk_text),
+          values: denseValues,
+          sparse_values: sparseValues,
           metadata: compactMetadata({
             cv_file_id: chunk.cv_file_id,
             cv_chunk_id: chunk.id,

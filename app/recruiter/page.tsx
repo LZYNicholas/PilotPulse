@@ -19,6 +19,9 @@ type Citation = {
   snippet: string;
   fileUrl: string | null;
   score: number;
+  denseScore?: number;
+  sparseScore?: number;
+  rerankScore?: number;
 };
 
 type RecruiterFile = {
@@ -66,6 +69,11 @@ function makeMessage(
     text,
     citations,
   };
+}
+
+function formatScore(score?: number) {
+  if (score === undefined) return "n/a";
+  return `${Math.round(score * 100)}%`;
 }
 
 export default function RecruiterChat() {
@@ -391,6 +399,11 @@ export default function RecruiterChat() {
                     </span>
                     <span className="mt-1 block truncate text-xs text-zinc-400">
                       {citation.filename} / chunk {citation.chunkIndex}
+                    </span>
+                    <span className="mt-2 block text-xs text-zinc-500">
+                      Score {formatScore(citation.rerankScore ?? citation.score)} / Dense{" "}
+                      {formatScore(citation.denseScore)} / Sparse{" "}
+                      {formatScore(citation.sparseScore)}
                     </span>
                     <span className="mt-3 block text-xs leading-5 text-zinc-300">
                       {citation.snippet}

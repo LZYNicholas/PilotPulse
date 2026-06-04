@@ -2,7 +2,7 @@ import {
   describePineconeIndex,
   getPineconeNamespace,
   getPineconeApiKey,
-  getPineconeIndexName,
+  type PineconeSparseVector,
 } from "@/lib/pinecone/client";
 
 export type PineconeMatch = {
@@ -26,12 +26,19 @@ type PineconeQueryResponse = {
 export async function queryPinecone(
   queryVector: number[],
   topK = 8,
+  sparseVector?: PineconeSparseVector,
 ): Promise<PineconeMatch[]> {
   const index = await describePineconeIndex();
 
   if (!index.status?.ready) {
     throw new Error(
       `Pinecone index ${index.name} is not ready. Current state: ${index.status?.state ?? "unknown"}.`,
+    );
+  }
+
+  if (sparseVector && index.metric.toLowerCase() !== "dotproduct") {
+    throw new Error(
+      `Pinecone index ${index.name} uses metric ${index.metric}. Hybrid sparse+dense query requires dotproduct.`,
     );
   }
 
@@ -45,6 +52,7 @@ export async function queryPinecone(
     body: JSON.stringify({
       namespace: getPineconeNamespace(),
       vector: queryVector,
+      sparseVector,
       topK,
       includeMetadata: true,
     }),

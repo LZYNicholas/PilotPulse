@@ -48,6 +48,7 @@ type CvChunkRow = {
   cv_file_id: string;
   chunk_index: number;
   chunk_text: string;
+  pinecone_vector_id: string;
   token_count: number | null;
   char_count: number;
   cv_files: CvFileRow | CvFileRow[] | null;
@@ -64,6 +65,7 @@ export type SearchResult = {
   cvFileId: string;
   chunkIndex: number;
   chunkText: string;
+  pineconeVectorId: string;
   score: number;
   originalFilename: string;
   candidateName: string | null;
@@ -117,6 +119,7 @@ export async function searchCvChunks(
       cv_file_id,
       chunk_index,
       chunk_text,
+      pinecone_vector_id,
       token_count,
       char_count,
       cv_files!inner (
@@ -197,6 +200,7 @@ export async function searchCvChunks(
     cvFileId: entry.row.cv_file_id,
     chunkIndex: entry.row.chunk_index,
     chunkText: entry.row.chunk_text,
+    pineconeVectorId: entry.row.pinecone_vector_id,
     score: entry.score,
     originalFilename: entry.file.original_filename,
     candidateName: entry.file.candidate_name,

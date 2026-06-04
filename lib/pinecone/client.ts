@@ -11,9 +11,15 @@ type PineconeIndexDescription = {
   };
 };
 
+export type PineconeSparseVector = {
+  indices: number[];
+  values: number[];
+};
+
 export type PineconeVector = {
   id: string;
   values: number[];
+  sparse_values?: PineconeSparseVector;
   metadata?: Record<string, string | number | boolean | null>;
 };
 
@@ -83,6 +89,14 @@ export async function upsertPineconeVectors(vectors: PineconeVector[]) {
   if (mismatchedVector) {
     throw new Error(
       `Vector ${mismatchedVector.id} has dimension ${mismatchedVector.values.length}, but Pinecone index ${index.name} expects ${index.dimension}.`,
+    );
+  }
+
+  const hasSparseValues = vectors.some((vector) => vector.sparse_values);
+
+  if (hasSparseValues && index.metric.toLowerCase() !== "dotproduct") {
+    throw new Error(
+      `Pinecone index ${index.name} uses metric ${index.metric}. Hybrid sparse+dense search requires dotproduct.`,
     );
   }
 
