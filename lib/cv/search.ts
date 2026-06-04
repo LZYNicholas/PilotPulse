@@ -53,6 +53,12 @@ type CvChunkRow = {
   cv_files: CvFileRow | CvFileRow[] | null;
 };
 
+type ScoredChunkRow = {
+  row: CvChunkRow;
+  file: CvFileRow;
+  score: number;
+};
+
 export type SearchResult = {
   chunkId: string;
   cvFileId: string;
@@ -77,22 +83,21 @@ function getCvFile(row: CvChunkRow) {
 }
 
 function scoreChunk(questionTerms: string[], chunk: CvChunkRow) {
-  const text = chunk.chunk_text.toLowerCase();
+  const textTerms = new Set(tokenize(chunk.chunk_text));
   const file = getCvFile(chunk);
-  const metadata = [
-    file?.original_filename,
-    file?.candidate_name,
-    file?.candidate_email,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+  const metadataTerms = new Set(
+    tokenize(
+      [file?.original_filename, file?.candidate_name, file?.candidate_email]
+        .filter(Boolean)
+        .join(" "),
+    ),
+  );
 
   return questionTerms.reduce((score, term) => {
     let nextScore = score;
 
-    if (text.includes(term)) nextScore += 2;
-    if (metadata.includes(term)) nextScore += 3;
+    if (textTerms.has(term)) nextScore += 2;
+    if (metadataTerms.has(term)) nextScore += 3;
 
     return nextScore;
   }, 0);
@@ -136,28 +141,65 @@ export async function searchCvChunks(
     .map((row) => {
       const file = getCvFile(row);
 
+      if (!file) return null;
+
       return {
         row,
         file,
         score: questionTerms.length > 0 ? scoreChunk(questionTerms, row) : 1,
       };
     })
-    .filter((entry) => entry.file)
+    .filter((entry): entry is ScoredChunkRow => entry !== null)
     .sort((a, b) => b.score - a.score || a.row.chunk_index - b.row.chunk_index);
 
-  const bestRows =
-    scoredRows.some((entry) => entry.score > 0)
-      ? scoredRows.filter((entry) => entry.score > 0)
+  const matchingFileIds = new Set(
+    scoredRows.filter((entry) => entry.score > 0).map((entry) => entry.file.id),
+  );
+  const candidateRows =
+    matchingFileIds.size > 0
+      ? scoredRows.filter((entry) => matchingFileIds.has(entry.file.id))
       : scoredRows;
 
-  return bestRows.slice(0, resultLimit).map<SearchResult>((entry) => ({
+  const groupedRows = new Map<
+    string,
+    {
+      fileScore: number;
+      entries: ScoredChunkRow[];
+    }
+  >();
+
+  candidateRows.forEach((entry) => {
+    const group = groupedRows.get(entry.file.id) ?? {
+      fileScore: 0,
+      entries: [],
+    };
+
+    group.fileScore = Math.max(group.fileScore, entry.score);
+    group.entries.push(entry);
+    groupedRows.set(entry.file.id, group);
+  });
+
+  const rankedGroups = [...groupedRows.values()]
+    .map((group) => ({
+      ...group,
+      entries: group.entries.sort(
+        (a, b) => b.score - a.score || a.row.chunk_index - b.row.chunk_index,
+      ),
+    }))
+    .sort((a, b) => b.fileScore - a.fileScore);
+
+  const diverseRows = rankedGroups.flatMap((group) => group.entries.slice(0, 2));
+  const fallbackRows = rankedGroups.flatMap((group) => group.entries.slice(2));
+  const bestRows = [...diverseRows, ...fallbackRows].slice(0, resultLimit);
+
+  return bestRows.map<SearchResult>((entry) => ({
     chunkId: entry.row.id,
     cvFileId: entry.row.cv_file_id,
     chunkIndex: entry.row.chunk_index,
     chunkText: entry.row.chunk_text,
     score: entry.score,
-    originalFilename: entry.file?.original_filename ?? "Unknown CV",
-    candidateName: entry.file?.candidate_name ?? null,
-    candidateEmail: entry.file?.candidate_email ?? null,
+    originalFilename: entry.file.original_filename,
+    candidateName: entry.file.candidate_name,
+    candidateEmail: entry.file.candidate_email,
   }));
 }
