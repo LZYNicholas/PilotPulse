@@ -7,7 +7,7 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 export const runtime = "nodejs";
 
 const GEMINI_CHAT_MODEL =
-  process.env.GEMINI_CHAT_MODEL ?? "gemini-1.5-flash";
+  process.env.GEMINI_CHAT_MODEL ?? "gemini-2.5-flash";
 
 const GEMINI_CHAT_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent`;
 
@@ -46,6 +46,20 @@ type GeminiResponse = {
     message?: string;
   };
 };
+
+type Citation = {
+  cvFileId: string;
+  filename: string;
+  candidateName: string;
+  chunkIndex: number;
+  snippet: string;
+  fileUrl: string | null;
+  score: number;
+};
+
+function createSnippet(text: string) {
+  return text.replace(/\s+/g, " ").trim().slice(0, 260);
+}
 
 export async function POST(request: Request) {
   const body = (await request.json()) as {
@@ -101,6 +115,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       reply:
         "I could not find any relevant CV content to answer that question. Try uploading more CVs or rephrasing your question.",
+      citations: [],
     });
   }
 
@@ -111,7 +126,7 @@ export async function POST(request: Request) {
 
   const { data: chunkRows, error: chunkError } = await supabaseAdmin
     .from("cv_chunks")
-    .select("chunk_text, pinecone_vector_id, cv_file_id")
+    .select("chunk_index, chunk_text, pinecone_vector_id, cv_file_id")
     .in("pinecone_vector_id", pineconeVectorIds);
 
   if (chunkError) {
@@ -134,7 +149,7 @@ export async function POST(request: Request) {
 
   const { data: cvFileRows } = await supabaseAdmin
     .from("cv_files")
-    .select("id, candidate_name, original_filename")
+    .select("id, candidate_name, original_filename, storage_path")
     .in("id", cvFileIds);
 
   const candidateNameByFileId = new Map(
@@ -143,6 +158,7 @@ export async function POST(request: Request) {
       row.candidate_name ?? row.original_filename,
     ]),
   );
+  const cvFileById = new Map((cvFileRows ?? []).map((row) => [row.id, row]));
 
   // ── Step 4: Build the context string for Gemini ─────────────────────────
   // Sort matches by score descending and build labelled context blocks.
@@ -165,8 +181,35 @@ export async function POST(request: Request) {
     return NextResponse.json({
       reply:
         "I found some matches but could not retrieve their content. Please try again.",
+      citations: [],
     });
   }
+
+  const citations: Citation[] = await Promise.all(
+    matches.flatMap(async (match) => {
+      const chunk = chunkByVectorId.get(match.id);
+      if (!chunk) return [];
+
+      const cvFile = cvFileById.get(chunk.cv_file_id);
+      if (!cvFile) return [];
+
+      const { data: signedUrlData } = await supabaseAdmin.storage
+        .from("cv-uploads")
+        .createSignedUrl(cvFile.storage_path, 60 * 60);
+
+      return [
+        {
+          cvFileId: chunk.cv_file_id,
+          filename: cvFile.original_filename,
+          candidateName: cvFile.candidate_name ?? cvFile.original_filename,
+          chunkIndex: chunk.chunk_index,
+          snippet: createSnippet(chunk.chunk_text),
+          fileUrl: signedUrlData?.signedUrl ?? null,
+          score: match.score,
+        },
+      ];
+    }),
+  ).then((items) => items.flat().slice(0, 5));
 
   const contextText = contextBlocks.join("\n\n");
 
@@ -203,7 +246,7 @@ export async function POST(request: Request) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      system_instruction: {
+      systemInstruction: {
         parts: [{ text: SYSTEM_PROMPT }],
       },
       contents,
@@ -245,6 +288,6 @@ export async function POST(request: Request) {
     );
   }
 
-  return NextResponse.json({ reply: replyText });
+  return NextResponse.json({ reply: replyText, citations });
 }
 

@@ -19,7 +19,7 @@ export type PineconeVector = {
 
 let cachedIndexDescription: PineconeIndexDescription | null = null;
 
-function getPineconeApiKey() {
+export function getPineconeApiKey() {
   const apiKey = process.env.PINECONE_API_KEY;
 
   if (!apiKey) {
