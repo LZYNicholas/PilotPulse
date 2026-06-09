@@ -36,6 +36,7 @@ type RecruiterFile = {
   id: string;
   originalFilename: string;
   fileSizeBytes: number;
+  mimeType: string;
   uploadStatus: string;
   uploadedAt: string;
   candidateName: string | null;
@@ -177,17 +178,47 @@ export default function RecruiterChat() {
   const [listError, setListError] = useState<string | null>(null);
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [showAllFiles, setShowAllFiles] = useState(false);
+  const [fileSearch, setFileSearch] = useState("");
+  const [fileStatusFilter, setFileStatusFilter] = useState("all");
   const [openConversationMenuId, setOpenConversationMenuId] = useState<
     string | null
   >(null);
   const [openFileMenuId, setOpenFileMenuId] = useState<string | null>(null);
+  const [activePreviewFile, setActivePreviewFile] = useState<RecruiterFile | null>(
+    null,
+  );
   const skipNextConversationLoadRef = useRef<string | null>(null);
 
-  const visibleFiles = showAllFiles ? files : files.slice(0, 8);
   const activeCitationMessage = messages.find(
     (message) => message.id === activeCitationMessageId,
   );
   const activeCitations = activeCitationMessage?.citations ?? [];
+  const hasSidePanel = isSourcesPanelOpen || activePreviewFile !== null;
+
+  const filteredFiles = useMemo(() => {
+    const normalizedSearch = fileSearch.trim().toLowerCase();
+
+    return files.filter((file) => {
+      const matchesStatus =
+        fileStatusFilter === "all" || file.uploadStatus === fileStatusFilter;
+
+      const haystack = [
+        file.candidateName,
+        file.originalFilename,
+        file.candidateEmail,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      const matchesSearch =
+        !normalizedSearch || haystack.includes(normalizedSearch);
+
+      return matchesStatus && matchesSearch;
+    });
+  }, [fileSearch, fileStatusFilter, files]);
+
+  const visibleFiles = showAllFiles ? filteredFiles : filteredFiles.slice(0, 8);
 
   const activeConversationSummary = useMemo(
     () =>
@@ -195,6 +226,12 @@ export default function RecruiterChat() {
       null,
     [activeConversationId, conversations],
   );
+
+  const promptSuggestions = [
+    "Compare the top 3 candidates for safety roles.",
+    "What are the strengths of the strongest HSE candidates?",
+    "What are the weaknesses or gaps among the project management candidates?",
+  ];
 
   async function loadFiles() {
     setIsLoadingFiles(true);
@@ -561,8 +598,15 @@ export default function RecruiterChat() {
   }
 
   function openSourcesPanel(messageId: string) {
+    setActivePreviewFile(null);
     setActiveCitationMessageId(messageId);
     setIsSourcesPanelOpen(true);
+  }
+
+  function openPreviewPanel(file: RecruiterFile) {
+    setIsSourcesPanelOpen(false);
+    setActiveCitationMessageId(null);
+    setActivePreviewFile(file);
   }
 
   useEffect(() => {
@@ -684,7 +728,7 @@ export default function RecruiterChat() {
             })}
           </div>
 
-          <div className="mt-6 border-t border-white/10 pt-4">
+                  <div className="mt-6 border-t border-white/10 pt-4">
             <div className="flex items-center justify-between text-xs uppercase tracking-wide text-zinc-500">
               <span>Knowledge base</span>
               <button
@@ -695,6 +739,24 @@ export default function RecruiterChat() {
                 Refresh
               </button>
             </div>
+            <div className="mt-3 grid grid-cols-1 gap-2">
+              <input
+                value={fileSearch}
+                onChange={(event) => setFileSearch(event.target.value)}
+                placeholder="Search CVs"
+                className="h-9 rounded-lg border border-white/10 bg-white/[0.04] px-3 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
+              />
+              <select
+                value={fileStatusFilter}
+                onChange={(event) => setFileStatusFilter(event.target.value)}
+                className="h-9 rounded-lg border border-white/10 bg-white/[0.04] px-3 text-sm text-zinc-100 outline-none"
+              >
+                <option value="all">All statuses</option>
+                <option value="ready">Ready</option>
+                <option value="processing">Processing</option>
+                <option value="failed">Failed</option>
+              </select>
+            </div>
             <div className="mt-3 space-y-2">
               {isLoadingFiles ? (
                 <p className="px-2 text-xs text-zinc-400">Loading CVs...</p>
@@ -702,7 +764,7 @@ export default function RecruiterChat() {
               {listError ? (
                 <p className="px-2 text-xs text-red-300">{listError}</p>
               ) : null}
-              {!isLoadingFiles && !listError && files.length === 0 ? (
+              {!isLoadingFiles && !listError && filteredFiles.length === 0 ? (
                 <p className="px-2 text-xs text-zinc-400">No CVs loaded yet.</p>
               ) : null}
               {visibleFiles.map((file) => (
@@ -713,9 +775,14 @@ export default function RecruiterChat() {
                   <div className="flex items-start gap-2">
                     <a
                       href={file.fileUrl ?? undefined}
-                      target="_blank"
+                      target={file.mimeType === "application/pdf" ? undefined : "_blank"}
                       rel="noreferrer"
                       aria-disabled={!file.fileUrl}
+                      onClick={(event) => {
+                        if (!file.fileUrl) return;
+                        event.preventDefault();
+                        openPreviewPanel(file);
+                      }}
                       className={`block min-w-0 flex-1 rounded-md px-1.5 py-0.5 ${
                         file.fileUrl
                           ? "hover:bg-white/[0.05]"
@@ -758,13 +825,13 @@ export default function RecruiterChat() {
                   ) : null}
                 </div>
               ))}
-              {files.length > 8 ? (
+              {filteredFiles.length > 8 ? (
                 <button
                   type="button"
                   onClick={() => setShowAllFiles((current) => !current)}
                   className="w-full rounded-lg px-2 py-2 text-left text-xs text-zinc-300 hover:bg-white/[0.05]"
                 >
-                  {showAllFiles ? "See less" : `See ${files.length - 8} more`}
+                  {showAllFiles ? "See less" : `See ${filteredFiles.length - 8} more`}
                 </button>
               ) : null}
             </div>
@@ -888,6 +955,18 @@ export default function RecruiterChat() {
         </div>
 
         <div className="shrink-0 px-4 pb-4">
+          <div className="mx-auto mb-3 flex w-full max-w-3xl flex-wrap gap-2">
+            {promptSuggestions.map((suggestion) => (
+              <button
+                key={suggestion}
+                type="button"
+                onClick={() => setPrompt(suggestion)}
+                className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-zinc-300 hover:bg-white/[0.08] hover:text-zinc-100"
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
           <form
             onSubmit={submitMessage}
             className="mx-auto flex w-full max-w-3xl items-end gap-2 rounded-3xl border border-white/10 bg-[#2f2f2f] p-2 shadow-lg"
@@ -913,13 +992,18 @@ export default function RecruiterChat() {
         </div>
       </section>
 
-      {isSourcesPanelOpen ? (
+      {hasSidePanel ? (
         <aside className="fixed inset-y-0 right-0 z-20 flex w-full max-w-[380px] flex-col border-l border-white/10 bg-[#171717] shadow-2xl md:relative md:z-auto md:h-screen md:w-[360px] md:shrink-0 md:shadow-none">
           <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4">
-            <h2 className="text-sm font-semibold">Sources</h2>
+            <h2 className="text-sm font-semibold">
+              {isSourcesPanelOpen ? "Sources" : "CV Preview"}
+            </h2>
             <button
               type="button"
-              onClick={() => setIsSourcesPanelOpen(false)}
+              onClick={() => {
+                setIsSourcesPanelOpen(false);
+                setActivePreviewFile(null);
+              }}
               className="flex h-8 w-8 items-center justify-center rounded-full text-zinc-300 hover:bg-white/10 hover:text-white"
               aria-label="Close sources"
               title="Close"
@@ -929,9 +1013,10 @@ export default function RecruiterChat() {
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            {activeCitations.length === 0 ? (
-              <p className="text-sm text-zinc-400">No sources selected.</p>
-            ) : (
+            {isSourcesPanelOpen ? (
+              activeCitations.length === 0 ? (
+                <p className="text-sm text-zinc-400">No sources selected.</p>
+              ) : (
               <div className="space-y-3">
                 {activeCitations.map((citation, index) => (
                   <a
@@ -963,7 +1048,43 @@ export default function RecruiterChat() {
                   </a>
                 ))}
               </div>
-            )}
+              )
+            ) : activePreviewFile ? (
+              <div className="space-y-3">
+                <div>
+                  <p className="truncate text-sm font-medium text-zinc-100">
+                    {activePreviewFile.candidateName ?? activePreviewFile.originalFilename}
+                  </p>
+                  <p className="mt-1 text-xs text-zinc-500">
+                    {formatBytes(activePreviewFile.fileSizeBytes)} /{" "}
+                    {formatDate(activePreviewFile.uploadedAt)}
+                  </p>
+                </div>
+                {activePreviewFile.mimeType === "application/pdf" &&
+                activePreviewFile.fileUrl ? (
+                  <iframe
+                    src={activePreviewFile.fileUrl}
+                    title={activePreviewFile.originalFilename}
+                    className="h-[70vh] w-full rounded-lg border border-white/10 bg-white"
+                  />
+                ) : (
+                  <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4 text-sm text-zinc-300">
+                    Inline preview is best for PDF files. Open this CV in a new tab to
+                    inspect the full document.
+                  </div>
+                )}
+                {activePreviewFile.fileUrl ? (
+                  <a
+                    href={activePreviewFile.fileUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-zinc-200 hover:bg-white/[0.08]"
+                  >
+                    Open in new tab
+                  </a>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </aside>
       ) : null}
