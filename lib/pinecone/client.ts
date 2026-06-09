@@ -120,3 +120,35 @@ export async function upsertPineconeVectors(vectors: PineconeVector[]) {
 
   return (await response.json()) as { upsertedCount?: number };
 }
+
+export async function deletePineconeVectors(ids: string[]) {
+  if (ids.length === 0) return { deletedCount: 0 };
+
+  const index = await describePineconeIndex();
+
+  if (!index.status?.ready) {
+    throw new Error(
+      `Pinecone index ${index.name} is not ready. Current state: ${index.status?.state ?? "unknown"}.`,
+    );
+  }
+
+  const response = await fetch(`https://${index.host}/vectors/delete`, {
+    method: "POST",
+    headers: {
+      "Api-Key": getPineconeApiKey(),
+      "Content-Type": "application/json",
+      "X-Pinecone-Api-Version": PINECONE_API_VERSION,
+    },
+    body: JSON.stringify({
+      namespace: getPineconeNamespace(),
+      ids,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Failed to delete Pinecone vectors: ${errorBody}`);
+  }
+
+  return { deletedCount: ids.length };
+}

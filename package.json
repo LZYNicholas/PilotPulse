@@ -8,6 +8,7 @@
     "start": "next start",
     "pinecone:create-hybrid-index": "node scripts/create-hybrid-index.mjs",
     "index:chunks": "node scripts/index-existing-chunks.mjs",
+    "reset:data": "node scripts/reset-all-data.mjs",
     "lint": "eslint ."
   },
   "dependencies": {

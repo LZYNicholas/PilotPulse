@@ -14,6 +14,7 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 function getFileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
