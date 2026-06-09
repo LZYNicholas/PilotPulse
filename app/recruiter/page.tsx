@@ -42,6 +42,7 @@ type RecruiterFile = {
   candidateName: string | null;
   candidateEmail: string | null;
   fileUrl: string | null;
+  processingError?: string | null;
 };
 
 type ConversationSummary = {
@@ -613,6 +614,16 @@ export default function RecruiterChat() {
     void loadFiles();
     void loadConversations();
   }, []);
+
+  useEffect(() => {
+    if (!files.some((file) => file.uploadStatus === "processing")) return;
+
+    const intervalId = window.setInterval(() => {
+      void loadFiles();
+    }, 4000);
+
+    return () => window.clearInterval(intervalId);
+  }, [files]);
 
   useEffect(() => {
     if (!activeConversationId) return;

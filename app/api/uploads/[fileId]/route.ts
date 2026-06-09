@@ -11,6 +11,43 @@ type RouteContext = {
   }>;
 };
 
+export async function GET(_: Request, context: RouteContext) {
+  const { fileId } = await context.params;
+
+  const { data: cvFile, error } = await supabaseAdmin
+    .from("cv_files")
+    .select(
+      "id, original_filename, storage_path, file_size_bytes, mime_type, upload_status, uploaded_at, candidate_name, candidate_email, processing_error, extracted_text_char_count, chunk_count",
+    )
+    .eq("id", fileId)
+    .single();
+
+  if (error || !cvFile) {
+    return NextResponse.json({ error: "CV not found." }, { status: 404 });
+  }
+
+  const { data: signedUrlData } = await supabaseAdmin.storage
+    .from("cv-uploads")
+    .createSignedUrl(cvFile.storage_path, 60 * 60);
+
+  return NextResponse.json({
+    file: {
+      id: cvFile.id,
+      originalFilename: cvFile.original_filename,
+      fileSizeBytes: cvFile.file_size_bytes,
+      mimeType: cvFile.mime_type,
+      uploadStatus: cvFile.upload_status,
+      uploadedAt: cvFile.uploaded_at,
+      candidateName: cvFile.candidate_name,
+      candidateEmail: cvFile.candidate_email,
+      processingError: cvFile.processing_error,
+      extractedTextCharCount: cvFile.extracted_text_char_count ?? 0,
+      chunkCount: cvFile.chunk_count ?? 0,
+      fileUrl: signedUrlData?.signedUrl ?? null,
+    },
+  });
+}
+
 export async function DELETE(_: Request, context: RouteContext) {
   const { fileId } = await context.params;
 

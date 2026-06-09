@@ -4,6 +4,7 @@ export const runtime = "nodejs";
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const MAX_GEMINI_RETRIES = 2;
 
 const SYSTEM_PROMPT = `You are PilotPulse's job seeker onboarding assistant.
 
@@ -46,6 +47,32 @@ type MessageParam = {
   content: string;
 };
 
+type GeminiResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
+};
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryDelayMs(errorMessage: string) {
+  const secondsMatch = errorMessage.match(/retry in\s+([0-9.]+)s/i);
+  if (secondsMatch) {
+    return Math.ceil(Number(secondsMatch[1]) * 1000);
+  }
+
+  const durationMatch = errorMessage.match(/retryDelay\\?":\s*"(\d+)s"/i);
+  if (durationMatch) {
+    return Number(durationMatch[1]) * 1000;
+  }
+
+  return 8000;
+}
+
 export async function POST(request: Request) {
   const body = (await request.json()) as {
     messages: MessageParam[];
@@ -77,42 +104,62 @@ export async function POST(request: Request) {
     );
   }
 
-  const response = await fetch(GEMINI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: SYSTEM_PROMPT }],
-      },
-      contents: messages.map((message) => ({
-        role: message.role === "assistant" ? "model" : "user",
-        parts: [{ text: message.content }],
-      })),
-      generationConfig: {
-        maxOutputTokens: 512,
-      },
-    }),
-  });
+  let data: GeminiResponse | null = null;
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    console.error("Gemini API error:", errorBody);
+  try {
+    for (let attempt = 0; attempt <= MAX_GEMINI_RETRIES; attempt += 1) {
+      const response = await fetch(GEMINI_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: SYSTEM_PROMPT }],
+          },
+          contents: messages.map((message) => ({
+            role: message.role === "assistant" ? "model" : "user",
+            parts: [{ text: message.content }],
+          })),
+          generationConfig: {
+            maxOutputTokens: 512,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+
+        if (response.status === 429 && attempt < MAX_GEMINI_RETRIES) {
+          await sleep(parseRetryDelayMs(errorBody));
+          continue;
+        }
+
+        console.error("Gemini API error:", errorBody);
+        return NextResponse.json(
+          { error: "Failed to get a response from the AI." },
+          { status: 502 },
+        );
+      }
+
+      data = (await response.json()) as GeminiResponse;
+      break;
+    }
+  } catch (error) {
+    console.error("Job seeker chat error:", error);
     return NextResponse.json(
       { error: "Failed to get a response from the AI." },
       { status: 502 },
     );
   }
 
-  const data = (await response.json()) as {
-    candidates?: Array<{
-      content?: {
-        parts?: Array<{ text?: string }>;
-      };
-    }>;
-  };
+  if (!data) {
+    return NextResponse.json(
+      { error: "Failed to get a response from the AI." },
+      { status: 502 },
+    );
+  }
 
   const rawText =
     data.candidates?.[0]?.content?.parts

@@ -1,16 +1,16 @@
 import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 
-import { chunkCvText } from "@/lib/cv/chunk";
-import { extractCvText } from "@/lib/cv/extract";
-import { indexCvChunks } from "@/lib/rag/indexChunks";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
-const ALLOWED_EXTENSIONS = new Set(["pdf", "docx"]);
+const ALLOWED_EXTENSIONS = new Set(["pdf", "docx", "png", "jpg", "jpeg", "webp"]);
 const ALLOWED_MIME_TYPES = new Set([
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
 ]);
 
 export const runtime = "nodejs";
@@ -39,7 +39,7 @@ export async function GET() {
   const { data, error } = await supabaseAdmin
     .from("cv_files")
     .select(
-      "id, original_filename, storage_path, file_size_bytes, mime_type, upload_status, uploaded_at, candidate_name, candidate_email",
+      "id, original_filename, storage_path, file_size_bytes, mime_type, upload_status, uploaded_at, candidate_name, candidate_email, processing_error",
     )
     .is("deleted_at", null)
     .order("uploaded_at", { ascending: false });
@@ -67,6 +67,7 @@ export async function GET() {
         candidateName: file.candidate_name,
         candidateEmail: file.candidate_email,
         fileUrl: signedUrlData?.signedUrl ?? null,
+        processingError: file.processing_error ?? null,
       };
     }),
   );
@@ -96,6 +97,7 @@ export async function POST(request: Request) {
     mimeType: string;
     uploadStatus: string;
     fileUrl: string | null;
+    processingError: string | null;
   }> = [];
 
   for (const file of files) {
@@ -103,7 +105,9 @@ export async function POST(request: Request) {
 
     if (!ALLOWED_EXTENSIONS.has(extension)) {
       return NextResponse.json(
-        { error: `${file.name} is not a supported file type. Use PDF or DOCX.` },
+        {
+          error: `${file.name} is not a supported file type. Use PDF, DOCX, PNG, JPG, JPEG, or WEBP.`,
+        },
         { status: 400 },
       );
     }
@@ -163,91 +167,6 @@ export async function POST(request: Request) {
       );
     }
 
-    let extractedText = "";
-    let chunkCount = 0;
-    let uploadStatus = "ready";
-
-    try {
-      extractedText = await extractCvText({
-        buffer: fileBuffer,
-        filename: file.name,
-        mimeType: file.type,
-      });
-
-      if (!extractedText) {
-        throw new Error("No text could be extracted from this CV.");
-      }
-
-      const chunks = chunkCvText(extractedText, fileId);
-      chunkCount = chunks.length;
-      const chunkRows = chunks.map((chunk) => ({
-        id: randomUUID(),
-        cv_file_id: fileId,
-        chunk_index: chunk.chunkIndex,
-        chunk_text: chunk.chunkText,
-        token_count: chunk.tokenCount,
-        char_count: chunk.charCount,
-        pinecone_vector_id: chunk.pineconeVectorId,
-      }));
-
-      if (chunkRows.length > 0) {
-        const { error: chunkInsertError } = await supabaseAdmin
-          .from("cv_chunks")
-          .insert(chunkRows);
-
-        if (chunkInsertError) {
-          throw new Error(`Failed to save CV chunks: ${chunkInsertError.message}`);
-        }
-
-        await indexCvChunks({
-          cvFile: {
-            id: fileId,
-            originalFilename: file.name,
-          },
-          chunks: chunkRows.map((chunk) => ({
-            id: chunk.id,
-            cvFileId: chunk.cv_file_id,
-            chunkIndex: chunk.chunk_index,
-            chunkText: chunk.chunk_text,
-            pineconeVectorId: chunk.pinecone_vector_id,
-          })),
-        });
-      }
-
-      const { error: readyUpdateError } = await supabaseAdmin
-        .from("cv_files")
-        .update({
-          upload_status: "ready",
-          extracted_text: extractedText,
-          extracted_text_char_count: extractedText.length,
-          chunk_count: chunkCount,
-          processing_error: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", fileId);
-
-      if (readyUpdateError) {
-        throw new Error(`Failed to save extracted text: ${readyUpdateError.message}`);
-      }
-    } catch (error) {
-      uploadStatus = "failed";
-
-      const processingError =
-        error instanceof Error ? error.message : "CV processing failed.";
-
-      await supabaseAdmin
-        .from("cv_files")
-        .update({
-          upload_status: "failed",
-          processing_error: processingError,
-          extracted_text: extractedText || null,
-          extracted_text_char_count: extractedText.length,
-          chunk_count: chunkCount,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", fileId);
-    }
-
     const { data: signedUrlData } = await supabaseAdmin.storage
       .from("cv-uploads")
       .createSignedUrl(storagePath, 60 * 60);
@@ -258,8 +177,9 @@ export async function POST(request: Request) {
       storagePath: insertedRow.storage_path,
       fileSizeBytes: insertedRow.file_size_bytes,
       mimeType: insertedRow.mime_type,
-      uploadStatus,
+      uploadStatus: insertedRow.upload_status,
       fileUrl: signedUrlData?.signedUrl ?? null,
+      processingError: null,
     });
   }
 

@@ -5,12 +5,13 @@ import {
   DragEvent,
   FormEvent,
   KeyboardEvent,
+  useEffect,
   useRef,
   useState,
 } from "react";
 
 type Sender = "assistant" | "user";
-type UploadStatus = "uploading" | "uploaded" | "error";
+type UploadStatus = "uploading" | "processing" | "uploaded" | "error";
 
 type ChatMessage = {
   id: string;
@@ -37,14 +38,17 @@ const initialMessages: ChatMessage[] = [
   {
     id: "job-seeker-welcome",
     sender: "assistant",
-    text: "Upload your CV, then I will ask for your name, phone number, and email.",
+    text: "Upload your CV or CV image, then I will ask for your name, phone number, and email.",
   },
 ];
 
-const SUPPORTED_EXTENSIONS = new Set(["pdf", "docx"]);
+const SUPPORTED_EXTENSIONS = new Set(["pdf", "docx", "png", "jpg", "jpeg", "webp"]);
 const SUPPORTED_MIME_TYPES = new Set([
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
 ]);
 
 function formatBytes(bytes: number) {
@@ -55,6 +59,7 @@ function formatBytes(bytes: number) {
 
 function statusText(file: LocalFile) {
   if (file.status === "uploaded") return "Uploaded";
+  if (file.status === "processing") return "Processing";
   if (file.status === "uploading") return "Uploading";
   return file.error ?? "Upload failed";
 }
@@ -102,6 +107,94 @@ export default function JobSeekerChat() {
   // Holds confirmed contact details while waiting for user to say yes/no.
   const [pendingContact, setPendingContact] = useState<ContactDetails | null>(null);
 
+  useEffect(() => {
+    const processingFiles = localFiles.filter((file) => file.status === "processing");
+    if (processingFiles.length === 0) return;
+
+    const intervalId = window.setInterval(() => {
+      processingFiles.forEach((file) => {
+        void refreshFileStatus(file.id);
+      });
+    }, 3000);
+
+    return () => window.clearInterval(intervalId);
+  }, [localFiles]);
+
+  async function refreshFileStatus(fileId: string) {
+    try {
+      const response = await fetch(`/api/uploads/${fileId}`, { cache: "no-store" });
+      const payload = (await response.json()) as
+        | {
+            file?: {
+              id: string;
+              uploadStatus: string;
+              processingError: string | null;
+              fileUrl: string | null;
+            };
+          }
+        | undefined;
+
+      if (!response.ok || !payload?.file) {
+        return;
+      }
+
+      const nextFile = payload.file;
+
+      setLocalFiles((current) =>
+        current.map((file) => {
+          if (file.id !== fileId) return file;
+
+          if (nextFile.uploadStatus === "ready") {
+            return {
+              ...file,
+              status: "uploaded",
+              fileUrl: nextFile.fileUrl,
+              error: undefined,
+            };
+          }
+
+          if (nextFile.uploadStatus === "failed") {
+            return {
+              ...file,
+              status: "error",
+              fileUrl: nextFile.fileUrl,
+              error: nextFile.processingError ?? "Upload failed",
+            };
+          }
+
+          return {
+            ...file,
+            status: "processing",
+            fileUrl: nextFile.fileUrl,
+          };
+        }),
+      );
+    } catch {
+      // Best-effort polling; keep the current UI state and try again later.
+    }
+  }
+
+  async function startBackgroundProcessing(fileId: string) {
+    try {
+      await fetch(`/api/uploads/${fileId}/process`, {
+        method: "POST",
+      });
+      await refreshFileStatus(fileId);
+    } catch {
+      setLocalFiles((current) =>
+        current.map((file) =>
+          file.id === fileId
+            ? {
+                ...file,
+                status: "error",
+                error: "Background CV processing failed to start.",
+              }
+            : file,
+        ),
+      );
+    }
+  }
+
   async function uploadFiles(selectedFiles: File[]) {
     if (selectedFiles.length === 0) return;
 
@@ -110,7 +203,10 @@ export default function JobSeekerChat() {
     if (unsupportedFiles.length > 0) {
       setMessages((current) => [
         ...current,
-        makeMessage("assistant", "Only PDF and DOCX files can be uploaded."),
+        makeMessage(
+          "assistant",
+          "Only PDF, DOCX, PNG, JPG, JPEG, and WEBP files can be uploaded.",
+        ),
       ]);
       return;
     }
@@ -142,13 +238,15 @@ export default function JobSeekerChat() {
       });
 
       const payload = (await response.json()) as
-        | {
+          | {
             error?: string;
             files?: Array<{
               id: string;
               originalFilename: string;
               fileSizeBytes: number;
               fileUrl: string | null;
+              uploadStatus: string;
+              processingError: string | null;
             }>;
           }
         | undefined;
@@ -175,6 +273,10 @@ export default function JobSeekerChat() {
       const firstUploadedId = payload.files[0]?.id ?? null;
       setActiveFileId(firstUploadedId);
 
+      const failedUploads = payload.files.filter(
+        (file) => file.uploadStatus === "failed",
+      );
+
       // Reset any pending contact details from a previous upload session.
       setPendingContact(null);
 
@@ -191,17 +293,54 @@ export default function JobSeekerChat() {
           return {
             ...file,
             id: uploadedFile.id,
-            status: "uploaded",
+            status:
+              uploadedFile.uploadStatus === "failed"
+                ? "error"
+                : uploadedFile.uploadStatus === "ready"
+                  ? "uploaded"
+                  : "processing",
             fileUrl: uploadedFile.fileUrl,
-            error: undefined,
+            error: uploadedFile.processingError ?? undefined,
           };
         }),
       );
 
+      payload.files.forEach((file) => {
+        if (file.uploadStatus === "processing") {
+          void startBackgroundProcessing(file.id);
+        }
+      });
+
+      if (failedUploads.length > 0) {
+        setMessages((current) => [
+          ...current,
+          makeMessage(
+            "assistant",
+            "I uploaded your CV file, but I could not extract readable text from it. I can still collect and save your contact details for this submission.",
+          ),
+        ]);
+      } else {
+        setMessages((current) => [
+          ...current,
+          makeMessage(
+            "assistant",
+            "Your CV upload is saved. I am processing it in the background while we continue with your details.",
+          ),
+        ]);
+      }
+
       // Kick off the AI conversation now that we have a file ID.
-      // Pass the upload event as the first user turn so Claude has context.
+      // Pass the upload event as the first user turn so Gemini has context.
       await sendToAI(
-        [{ role: "user", content: "I just uploaded my CV." }],
+        [
+          {
+            role: "user",
+            content:
+              failedUploads.length > 0
+                ? "I just uploaded my CV, but the system could not extract readable text from it."
+                : "I just uploaded my CV.",
+          },
+        ],
         firstUploadedId,
       );
     } catch {
@@ -238,22 +377,28 @@ export default function JobSeekerChat() {
       });
 
       const data = (await response.json()) as {
-        reply: string;
+        reply?: string;
         action: "chat" | "confirm" | "save";
         contactDetails: ContactDetails | null;
+        error?: string;
       };
 
       if (!response.ok) {
         setMessages((current) => [
           ...current,
-          makeMessage("assistant", data.reply ?? "Something went wrong. Please try again."),
+          makeMessage(
+            "assistant",
+            data.error ?? data.reply ?? "Something went wrong. Please try again.",
+          ),
         ]);
         return;
       }
 
+      const replyText = data.reply ?? "Something went wrong. Please try again.";
+
       setMessages((current) => [
         ...current,
-        makeMessage("assistant", data.reply),
+        makeMessage("assistant", replyText),
       ]);
 
       // If Claude has all details and is asking the user to confirm, hold them in state.
@@ -390,7 +535,10 @@ export default function JobSeekerChat() {
     if (droppedFiles.some((file) => !isSupportedCvFile(file))) {
       setMessages((current) => [
         ...current,
-        makeMessage("assistant", "Only PDF and DOCX files can be uploaded."),
+        makeMessage(
+          "assistant",
+          "Only PDF, DOCX, PNG, JPG, JPEG, and WEBP files can be uploaded.",
+        ),
       ]);
       return;
     }
@@ -411,7 +559,7 @@ export default function JobSeekerChat() {
       {isDraggingFile ? (
         <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-[#212121]/75">
           <div className="rounded-2xl border border-[#10a37f] bg-[#283f39] px-6 py-4 text-sm font-medium text-white shadow-2xl">
-            Drop PDF or DOCX to upload
+            Drop PDF, DOCX, or CV image to upload
           </div>
         </div>
       ) : null}
@@ -511,7 +659,7 @@ export default function JobSeekerChat() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.docx"
+              accept=".pdf,.docx,.png,.jpg,.jpeg,.webp"
               className="hidden"
               onChange={handleUpload}
               disabled={isUploading || isReplying}
