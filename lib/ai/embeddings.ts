@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "@/lib/ai/fetchWithRetry";
+
 const GEMINI_EMBEDDING_MODEL =
   process.env.GEMINI_EMBEDDING_MODEL ?? "gemini-embedding-001";
 const GEMINI_EMBEDDING_DIMENSION = Number(
@@ -31,7 +33,7 @@ export async function embedText(
     throw new Error("GEMINI_API_KEY is not configured.");
   }
 
-  const response = await fetch(
+  const response = await fetchWithRetry(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent`,
     {
       method: "POST",

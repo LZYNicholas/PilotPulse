@@ -13,9 +13,29 @@ const OCR_IMAGE_MIME_TYPES = new Set([
   "image/webp",
 ]);
 const OCR_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
-const PDF_OCR_RENDER_SCALE = 1.25;
+const PDF_OCR_RENDER_SCALE = 2;
 const MAX_PDF_OCR_PAGES = 2;
 const MIN_OCR_TEXT_LENGTH = 800;
+const OCR_TERM_DICTIONARY = [
+  "Redshift",
+  "PostgreSQL",
+  "MySQL",
+  "MongoDB",
+  "Snowflake",
+  "Databricks",
+  "Airflow",
+  "Kubernetes",
+  "Docker",
+  "Terraform",
+  "TypeScript",
+  "JavaScript",
+  "React",
+  "Next.js",
+  "Node.js",
+  "Tableau",
+  "Looker",
+  "Power BI",
+];
 
 let ocrWorkerPromise: Promise<Awaited<ReturnType<typeof createWorker>>> | null = null;
 
@@ -39,6 +59,86 @@ function normalizeExtractedText(text: string) {
     .trim();
 }
 
+function levenshteinDistance(a: string, b: string) {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = previous[0];
+    previous[0] = i;
+
+    for (let j = 1; j <= b.length; j += 1) {
+      const nextDiagonal = previous[j];
+      const substitutionCost = a[i - 1] === b[j - 1] ? 0 : 1;
+      previous[j] = Math.min(
+        previous[j] + 1,
+        previous[j - 1] + 1,
+        diagonal + substitutionCost,
+      );
+      diagonal = nextDiagonal;
+    }
+  }
+
+  return previous[b.length];
+}
+
+function preserveTokenCase(source: string, target: string) {
+  if (source === source.toUpperCase()) {
+    return target.toUpperCase();
+  }
+
+  if (source === source.toLowerCase()) {
+    return target.toLowerCase();
+  }
+
+  if (
+    source[0] === source[0]?.toUpperCase() &&
+    source.slice(1) === source.slice(1).toLowerCase()
+  ) {
+    return target[0]?.toUpperCase() + target.slice(1);
+  }
+
+  return target;
+}
+
+function correctOcrToken(token: string) {
+  const normalizedToken = token.replace(/[^A-Za-z+.]/g, "");
+  if (normalizedToken.length < 4) return token;
+
+  const lowerToken = normalizedToken.toLowerCase();
+  let bestMatch: string | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const candidate of OCR_TERM_DICTIONARY) {
+    const candidateToken = candidate.replace(/\s+/g, "");
+    const distance = levenshteinDistance(
+      lowerToken,
+      candidateToken.toLowerCase(),
+    );
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestMatch = candidateToken;
+    }
+  }
+
+  const maxDistance = normalizedToken.length >= 8 ? 2 : 1;
+  if (!bestMatch || bestDistance > maxDistance) {
+    return token;
+  }
+
+  const prefix = token.match(/^[^A-Za-z+]*/)?.[0] ?? "";
+  const suffix = token.match(/[^A-Za-z.]+$/)?.[0] ?? "";
+  return `${prefix}${preserveTokenCase(normalizedToken, bestMatch)}${suffix}`;
+}
+
+function postProcessOcrText(text: string) {
+  return text.replace(/\b[\w.+-]{4,}\b/g, correctOcrToken);
+}
+
 async function extractPdfText(buffer: Buffer) {
   const result = await pdfParse(buffer);
   return result.text;
@@ -51,18 +151,27 @@ async function extractDocxText(buffer: Buffer) {
 
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
-    ocrWorkerPromise = createWorker("eng", 1, {
-      workerPath: path.join(
-        process.cwd(),
-        "node_modules",
-        "tesseract.js",
-        "src",
-        "worker-script",
-        "node",
-        "index.js",
-      ),
-      cachePath: path.join(process.cwd(), ".cache", "tesseract"),
-    });
+    ocrWorkerPromise = (async () => {
+      const worker = await createWorker("eng", 1, {
+        workerPath: path.join(
+          process.cwd(),
+          "node_modules",
+          "tesseract.js",
+          "src",
+          "worker-script",
+          "node",
+          "index.js",
+        ),
+        cachePath: path.join(process.cwd(), ".cache", "tesseract"),
+      });
+
+      await worker.setParameters({
+        preserve_interword_spaces: "1",
+        user_defined_dpi: "300",
+      });
+
+      return worker;
+    })();
   }
 
   return ocrWorkerPromise;
@@ -71,7 +180,7 @@ async function getOcrWorker() {
 async function extractImageTextWithOcr(buffer: Buffer) {
   const worker = await getOcrWorker();
   const result = await worker.recognize(buffer);
-  return result.data.text;
+  return postProcessOcrText(result.data.text);
 }
 
 async function loadPdfForOcr(buffer: Buffer) {

@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { NextResponse } from "next/server";
 
 import { embedText } from "@/lib/ai/embeddings";
+import { fetchWithRetry } from "@/lib/ai/fetchWithRetry";
 import { hybridSearchCvChunks } from "@/lib/rag/hybridSearch";
 import {
   buildRetrievalQueries,
@@ -23,7 +24,6 @@ const DEFAULT_HYBRID_ALPHA = 0.5;
 const MAX_CONTEXT_CHUNKS_PER_QUESTION = 2;
 const MAX_CANDIDATES_PER_QUESTION = 3;
 const MAX_CHUNKS_PER_CANDIDATE = 2;
-const MAX_GEMINI_RETRIES = 2;
 const ANSWER_CACHE_TTL_MS = 5 * 60 * 1000;
 const SECTION_CONFIDENCE_THRESHOLD = Number(
   process.env.RECRUITER_RAG_SECTION_CONFIDENCE_THRESHOLD ?? "1.5",
@@ -237,24 +237,6 @@ function getCandidateIdentity({
 
 function createCitationKey(citation: Citation) {
   return `${normalizeFilename(citation.filename)}:${citation.chunkIndex}`;
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function parseRetryDelayMs(errorMessage: string) {
-  const secondsMatch = errorMessage.match(/retry in\s+([0-9.]+)s/i);
-  if (secondsMatch) {
-    return Math.ceil(Number(secondsMatch[1]) * 1000);
-  }
-
-  const durationMatch = errorMessage.match(/retryDelay\\?":\s*"(\d+)s"/i);
-  if (durationMatch) {
-    return Number(durationMatch[1]) * 1000;
-  }
-
-  return 15000;
 }
 
 function normalizeRecruiterReply(text: string) {
@@ -519,8 +501,9 @@ async function generateRecruiterReply({
 
   const contents = [...history.slice(0, -1), finalUserTurn];
 
-  for (let attempt = 0; attempt <= MAX_GEMINI_RETRIES; attempt += 1) {
-    const geminiResponse = await fetch(`${GEMINI_CHAT_URL}?key=${apiKey}`, {
+  const geminiResponse = await fetchWithRetry(
+    `${GEMINI_CHAT_URL}?key=${apiKey}`,
+    {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -535,48 +518,32 @@ async function generateRecruiterReply({
           temperature: 0.2,
         },
       }),
-    });
+    },
+  );
 
-    if (!geminiResponse.ok) {
-      const errorBody = await geminiResponse.text();
-
-      if (geminiResponse.status === 429 && attempt < MAX_GEMINI_RETRIES) {
-        await sleep(parseRetryDelayMs(errorBody));
-        continue;
-      }
-
-      throw new Error(`Gemini API error: ${errorBody}`);
-    }
-
-    const geminiData = (await geminiResponse.json()) as GeminiResponse;
-
-    if (geminiData.error?.message) {
-      if (
-        geminiData.error.message.includes("RESOURCE_EXHAUSTED") &&
-        attempt < MAX_GEMINI_RETRIES
-      ) {
-        await sleep(parseRetryDelayMs(geminiData.error.message));
-        continue;
-      }
-
-      throw new Error(geminiData.error.message);
-    }
-
-    const replyText =
-      geminiData.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text ?? "")
-        .join("") ?? "";
-
-    if (!replyText) {
-      throw new Error("Gemini returned an empty response.");
-    }
-
-    const normalizedReply = normalizeRecruiterReply(replyText);
-    setCachedAnswer(cacheKey, normalizedReply);
-    return normalizedReply;
+  if (!geminiResponse.ok) {
+    const errorBody = await geminiResponse.text();
+    throw new Error(`Gemini API error: ${errorBody}`);
   }
 
-  throw new Error("Gemini returned an empty response.");
+  const geminiData = (await geminiResponse.json()) as GeminiResponse;
+
+  if (geminiData.error?.message) {
+    throw new Error(geminiData.error.message);
+  }
+
+  const replyText =
+    geminiData.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text ?? "")
+      .join("") ?? "";
+
+  if (!replyText) {
+    throw new Error("Gemini returned an empty response.");
+  }
+
+  const normalizedReply = normalizeRecruiterReply(replyText);
+  setCachedAnswer(cacheKey, normalizedReply);
+  return normalizedReply;
 }
 
 function buildContextBlocks({
