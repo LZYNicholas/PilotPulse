@@ -13,7 +13,7 @@ const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/
 const SYSTEM_PROMPT = `You are PilotPulse's job seeker onboarding assistant.
 
 Objective:
-Collect and confirm exactly three contact fields for the CV row attached to this chat:
+Collect and confirm exactly three contact fields before the candidate uploads a CV:
 1. Full name
 2. Phone number
 3. Email address
@@ -63,21 +63,14 @@ type GeminiResponse = {
 export async function POST(request: Request) {
   const body = (await request.json()) as {
     messages: MessageParam[];
-    cvFileId: string;
+    cvFileId?: string;
   };
 
-  const { messages, cvFileId } = body;
+  const { messages } = body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return NextResponse.json(
       { error: "messages array is required." },
-      { status: 400 },
-    );
-  }
-
-  if (!cvFileId) {
-    return NextResponse.json(
-      { error: "cvFileId is required." },
       { status: 400 },
     );
   }

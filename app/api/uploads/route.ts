@@ -35,6 +35,11 @@ function createSafeStorageFilename(filename: string) {
   return extension ? `${safeBasename}.${extension}` : safeBasename;
 }
 
+function getOptionalFormValue(formData: FormData, key: string) {
+  const value = formData.get(key);
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 export async function GET() {
   const { data, error } = await supabaseAdmin
     .from("cv_files")
@@ -78,6 +83,9 @@ export async function GET() {
 export async function POST(request: Request) {
   const formData = await request.formData();
   const fileEntries = formData.getAll("files");
+  const candidateName = getOptionalFormValue(formData, "candidateName");
+  const candidatePhone = getOptionalFormValue(formData, "candidatePhone");
+  const candidateEmail = getOptionalFormValue(formData, "candidateEmail");
 
   if (fileEntries.length === 0) {
     return NextResponse.json({ error: "No files were provided." }, { status: 400 });
@@ -154,6 +162,9 @@ export async function POST(request: Request) {
         mime_type: file.type,
         file_size_bytes: file.size,
         upload_status: "processing",
+        candidate_name: candidateName,
+        candidate_phone: candidatePhone,
+        candidate_email: candidateEmail,
       })
       .select("id, original_filename, storage_path, file_size_bytes, mime_type, upload_status")
       .single();
