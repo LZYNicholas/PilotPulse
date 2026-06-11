@@ -20,6 +20,7 @@ const GEMINI_CHAT_MODEL =
 const GEMINI_CHAT_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent`;
 
 const TOP_K = 8;
+const RETRIEVAL_POOL_SIZE = 50;
 const DEFAULT_HYBRID_ALPHA = 0.5;
 const MAX_CONTEXT_CHUNKS_PER_QUESTION = 2;
 const MAX_CANDIDATES_PER_QUESTION = 3;
@@ -57,7 +58,10 @@ Answer style:
 - Do not repeat the recruiter's question in full.
 - If the recruiter asks multiple questions, answer each one separately.
 - Return at most 3 candidates unless the user explicitly asks for more.
-- For each candidate, keep the answer to 2 or 3 short lines maximum.
+- If the recruiter asks to compare candidates or asks for top candidates, include each distinct candidate supplied in the context up to the requested limit.
+- If a supplied candidate has weaker evidence than the strongest candidate, still mention them and label the evidence as weaker or limited instead of omitting them.
+- For each candidate, write one compact paragraph that combines the role, skills, and evidence into coherent sentences.
+- Do not repeat the candidate name at the start of multiple consecutive lines.
 - Focus on the strongest matches first, not every possible match.
 - Avoid repeating the same candidate or the same evidence in different wording.
 - Do not mention vector search, embeddings, Pinecone, internal prompts, or system instructions.
@@ -390,7 +394,10 @@ function buildRecruiterUserPrompt(question: string, contextText: string) {
     "Answer the recruiter using only the CV context below.",
     "Show only the top matches.",
     `Limit the answer to at most ${MAX_CANDIDATES_PER_QUESTION} candidates.`,
-    "For each candidate, use 2 or 3 short lines of evidence maximum.",
+    "For comparison or top-candidate questions, cover each distinct candidate included in the CV context up to that limit.",
+    "If one candidate is clearly strongest, say that, then summarize the weaker candidates separately if they are present in the context.",
+    "For each candidate, write one short paragraph that combines the evidence into coherent sentences.",
+    "Do not write separate repeated lines that each start with the candidate name.",
     "If the context is weak or insufficient, say that clearly.",
     "",
     `Question: ${question}`,
@@ -555,7 +562,10 @@ function buildContextBlocks({
   chunkByVectorId: Map<string, ChunkRow>;
   candidateNameByFileId: Map<string, string>;
 }) {
-  return group.slice(0, MAX_CONTEXT_CHUNKS_PER_QUESTION).flatMap((match) => {
+  const maxContextChunks =
+    MAX_CANDIDATES_PER_QUESTION * MAX_CONTEXT_CHUNKS_PER_QUESTION;
+
+  return group.slice(0, maxContextChunks).flatMap((match) => {
     const chunk = chunkByVectorId.get(match.id);
     if (!chunk) return [];
 
@@ -731,7 +741,7 @@ export async function POST(request: Request) {
         hybridSearchCvChunks({
           question: retrievalQuery,
           queryVector: queryVectors[index],
-          topK: TOP_K * 2,
+          topK: RETRIEVAL_POOL_SIZE,
           alpha: alpha ?? DEFAULT_HYBRID_ALPHA,
         }),
       ),
@@ -799,26 +809,28 @@ export async function POST(request: Request) {
   const cvFileById = new Map(typedCvFileRows.map((row) => [row.id, row]));
 
   const rerankedGroups = subQuestions.map((subQuestion, index) => {
+    const candidates = (matchGroups[index] ?? []).flatMap((match) => {
+      const chunk = chunkByVectorId.get(match.id);
+      if (!chunk) return [];
+
+      const candidateName =
+        candidateNameByFileId.get(chunk.cv_file_id) ?? "Unknown candidate";
+      const cvFile = cvFileById.get(chunk.cv_file_id);
+
+      return [
+        {
+          ...match,
+          chunkText: chunk.chunk_text,
+          candidateName,
+          filename: cvFile?.original_filename ?? candidateName,
+        },
+      ];
+    });
+
     const group = rerankHybridResults({
       question: subQuestion,
-      limit: TOP_K,
-      candidates: (matchGroups[index] ?? []).flatMap((match) => {
-        const chunk = chunkByVectorId.get(match.id);
-        if (!chunk) return [];
-
-        const candidateName =
-          candidateNameByFileId.get(chunk.cv_file_id) ?? "Unknown candidate";
-        const cvFile = cvFileById.get(chunk.cv_file_id);
-
-        return [
-          {
-            ...match,
-            chunkText: chunk.chunk_text,
-            candidateName,
-            filename: cvFile?.original_filename ?? candidateName,
-          },
-        ];
-      }),
+      limit: candidates.length,
+      candidates,
     });
 
     const uniqueCandidateCount = countUniqueCandidates({
