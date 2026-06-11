@@ -20,7 +20,9 @@ const GEMINI_CHAT_MODEL =
 const GEMINI_CHAT_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_CHAT_MODEL}:generateContent`;
 
 const TOP_K = 8;
-const RETRIEVAL_POOL_SIZE = 50;
+const RETRIEVAL_POOL_SIZE = Number(
+  process.env.RECRUITER_RAG_RETRIEVAL_POOL_SIZE ?? "200",
+);
 const DEFAULT_HYBRID_ALPHA = 0.5;
 const MAX_CONTEXT_CHUNKS_PER_QUESTION = 2;
 const MAX_CANDIDATES_PER_QUESTION = 3;
