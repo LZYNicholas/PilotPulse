@@ -11,7 +11,7 @@ import {
 } from "react";
 
 type Sender = "assistant" | "user";
-type UploadStatus = "uploading" | "processing" | "uploaded" | "error";
+type UploadStatus = "uploading" | "uploaded" | "processing" | "ready" | "error";
 
 type ChatMessage = {
   id: string;
@@ -34,6 +34,18 @@ type ContactDetails = {
   email: string | null;
 };
 
+type UploadApiResponse = {
+  error?: string;
+  files?: Array<{
+    id: string;
+    originalFilename: string;
+    fileSizeBytes: number;
+    fileUrl: string | null;
+    uploadStatus: string;
+    processingError: string | null;
+  }>;
+};
+
 const initialMessages: ChatMessage[] = [
   {
     id: "job-seeker-welcome",
@@ -50,6 +62,14 @@ const SUPPORTED_MIME_TYPES = new Set([
   "image/jpeg",
   "image/webp",
 ]);
+const EXTENSION_TO_MIME_TYPE: Record<string, string> = {
+  pdf: "application/pdf",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+};
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -58,7 +78,8 @@ function formatBytes(bytes: number) {
 }
 
 function statusText(file: LocalFile) {
-  if (file.status === "uploaded") return "Uploaded";
+  if (file.status === "ready") return "Ready";
+  if (file.status === "uploaded") return "Waiting for details";
   if (file.status === "processing") return "Processing";
   if (file.status === "uploading") return "Uploading";
   return file.error ?? "Upload failed";
@@ -74,6 +95,32 @@ function makeMessage(sender: Sender, text: string): ChatMessage {
 
 function getFileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
+}
+
+function createSafeUploadFilename(filename: string) {
+  const extension = getFileExtension(filename);
+  const basename = filename
+    .replace(/\.[^/.]+$/, "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .toLowerCase();
+
+  const safeBasename = basename || "cv";
+  return extension ? `${safeBasename}.${extension}` : safeBasename;
+}
+
+function normalizeUploadFile(file: File) {
+  const extension = getFileExtension(file.name);
+  const contentType =
+    file.type || EXTENSION_TO_MIME_TYPE[extension] || "application/octet-stream";
+
+  return new File([file], createSafeUploadFilename(file.name), {
+    type: contentType,
+    lastModified: file.lastModified,
+  });
 }
 
 function isSupportedCvFile(file: File) {
@@ -107,6 +154,23 @@ export default function JobSeekerChat() {
   // Holds confirmed contact details while waiting for user to say yes/no.
   const [pendingContact, setPendingContact] = useState<ContactDetails | null>(null);
 
+  async function readJsonSafely(response: Response) {
+    const contentType = response.headers.get("content-type") ?? "";
+    const responseText = await response.text();
+
+    if (!responseText) return undefined;
+
+    if (!contentType.includes("application/json")) {
+      return { error: responseText };
+    }
+
+    try {
+      return JSON.parse(responseText) as UploadApiResponse;
+    } catch {
+      return { error: responseText };
+    }
+  }
+
   useEffect(() => {
     const processingFiles = localFiles.filter((file) => file.status === "processing");
     if (processingFiles.length === 0) return;
@@ -139,15 +203,17 @@ export default function JobSeekerChat() {
       }
 
       const nextFile = payload.file;
+      let completedProcessing = false;
 
       setLocalFiles((current) =>
         current.map((file) => {
           if (file.id !== fileId) return file;
 
           if (nextFile.uploadStatus === "ready") {
+            completedProcessing = file.status === "processing";
             return {
               ...file,
-              status: "uploaded",
+              status: "ready",
               fileUrl: nextFile.fileUrl,
               error: undefined,
             };
@@ -162,6 +228,15 @@ export default function JobSeekerChat() {
             };
           }
 
+          if (nextFile.uploadStatus === "uploaded") {
+            return {
+              ...file,
+              status: "uploaded",
+              fileUrl: nextFile.fileUrl,
+              error: undefined,
+            };
+          }
+
           return {
             ...file,
             status: "processing",
@@ -169,6 +244,16 @@ export default function JobSeekerChat() {
           };
         }),
       );
+
+      if (completedProcessing) {
+        setMessages((current) => [
+          ...current,
+          makeMessage(
+            "assistant",
+            "Your CV has finished processing and is ready for review.",
+          ),
+        ]);
+      }
     } catch {
       // Best-effort polling; keep the current UI state and try again later.
     }
@@ -176,9 +261,29 @@ export default function JobSeekerChat() {
 
   async function startBackgroundProcessing(fileId: string) {
     try {
-      await fetch(`/api/uploads/${fileId}/process`, {
+      const response = await fetch(`/api/uploads/${fileId}/process`, {
         method: "POST",
       });
+
+      if (!response.ok) {
+        const payload = (await readJsonSafely(response)) as
+          | { error?: string }
+          | undefined;
+
+        setLocalFiles((current) =>
+          current.map((file) =>
+            file.id === fileId
+              ? {
+                  ...file,
+                  status: "error",
+                  error: payload?.error ?? "Background CV processing failed to start.",
+                }
+              : file,
+          ),
+        );
+        return;
+      }
+
       await refreshFileStatus(fileId);
     } catch {
       setLocalFiles((current) =>
@@ -230,26 +335,17 @@ export default function JobSeekerChat() {
 
     try {
       const formData = new FormData();
-      selectedFiles.forEach((file) => formData.append("files", file));
+      selectedFiles.forEach((file) => {
+        const normalizedFile = normalizeUploadFile(file);
+        formData.append("files", normalizedFile, normalizedFile.name);
+      });
 
       const response = await fetch("/api/uploads", {
         method: "POST",
         body: formData,
       });
 
-      const payload = (await response.json()) as
-          | {
-            error?: string;
-            files?: Array<{
-              id: string;
-              originalFilename: string;
-              fileSizeBytes: number;
-              fileUrl: string | null;
-              uploadStatus: string;
-              processingError: string | null;
-            }>;
-          }
-        | undefined;
+      const payload = await readJsonSafely(response);
 
       if (!response.ok || !payload?.files) {
         const errorMessage = payload?.error ?? "Upload failed.";
@@ -273,22 +369,22 @@ export default function JobSeekerChat() {
       const firstUploadedId = payload.files[0]?.id ?? null;
       setActiveFileId(firstUploadedId);
 
-      const failedUploads = payload.files.filter(
-        (file) => file.uploadStatus === "failed",
-      );
-
       // Reset any pending contact details from a previous upload session.
       setPendingContact(null);
 
       setLocalFiles((current) =>
         current.map((file) => {
-          const uploadedFile = payload.files?.find(
-            (entry) =>
-              entry.originalFilename === file.name &&
-              entry.fileSizeBytes === file.size,
-          );
+          const pendingIndex = pendingFiles.findIndex((pending) => pending.id === file.id);
+          if (pendingIndex === -1) return file;
 
-          if (!uploadedFile) return file;
+          const uploadedFile = payload.files?.[pendingIndex];
+          if (!uploadedFile) {
+            return {
+              ...file,
+              status: "error",
+              error: "Upload response was incomplete.",
+            };
+          }
 
           return {
             ...file,
@@ -297,37 +393,23 @@ export default function JobSeekerChat() {
               uploadedFile.uploadStatus === "failed"
                 ? "error"
                 : uploadedFile.uploadStatus === "ready"
-                  ? "uploaded"
-                  : "processing",
+                  ? "ready"
+                  : uploadedFile.uploadStatus === "processing"
+                    ? "processing"
+                    : "uploaded",
             fileUrl: uploadedFile.fileUrl,
             error: uploadedFile.processingError ?? undefined,
           };
         }),
       );
 
-      payload.files.forEach((file) => {
-        if (file.uploadStatus === "processing") {
-          void startBackgroundProcessing(file.id);
-        }
-      });
-
-      if (failedUploads.length > 0) {
-        setMessages((current) => [
-          ...current,
-          makeMessage(
-            "assistant",
-            "I uploaded your CV file, but I could not extract readable text from it. I can still collect and save your contact details for this submission.",
-          ),
-        ]);
-      } else {
-        setMessages((current) => [
-          ...current,
-          makeMessage(
-            "assistant",
-            "Your CV upload is saved. I am processing it in the background while we continue with your details.",
-          ),
-        ]);
-      }
+      setMessages((current) => [
+        ...current,
+        makeMessage(
+          "assistant",
+          "Your CV upload is saved. Now I will collect your full name, phone number, and email before processing it.",
+        ),
+      ]);
 
       // Kick off the AI conversation now that we have a file ID.
       // Pass the upload event as the first user turn so Gemini has context.
@@ -335,25 +417,27 @@ export default function JobSeekerChat() {
         [
           {
             role: "user",
-            content:
-              failedUploads.length > 0
-                ? "I just uploaded my CV, but the system could not extract readable text from it."
-                : "I just uploaded my CV.",
+            content: "I just uploaded my CV.",
           },
         ],
         firstUploadedId,
       );
-    } catch {
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error && error.message
+          ? error.message
+          : "Upload failed.";
+
       setLocalFiles((current) =>
         current.map((file) =>
           pendingFiles.some((pending) => pending.id === file.id)
-            ? { ...file, status: "error", error: "Upload failed." }
+            ? { ...file, status: "error", error: errorMessage }
             : file,
         ),
       );
       setMessages((current) => [
         ...current,
-        makeMessage("assistant", "Upload failed."),
+        makeMessage("assistant", errorMessage),
       ]);
     } finally {
       setIsUploading(false);
@@ -448,14 +532,23 @@ export default function JobSeekerChat() {
 
       // Clear pending contact now that save succeeded.
       setPendingContact(null);
+      setLocalFiles((current) =>
+        current.map((file) =>
+          file.id === fileId
+            ? { ...file, status: "processing", error: undefined }
+            : file,
+        ),
+      );
 
       setMessages((current) => [
         ...current,
         makeMessage(
           "assistant",
-          "All done! Your contact details have been saved. Good luck with your application!",
+          "All done! Your contact details have been saved. I am processing your CV now.",
         ),
       ]);
+
+      await startBackgroundProcessing(fileId);
     } catch {
       setMessages((current) => [
         ...current,

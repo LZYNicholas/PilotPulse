@@ -16,7 +16,7 @@ export async function POST(_: Request, context: RouteContext) {
 
   const { data: cvFile, error } = await supabaseAdmin
     .from("cv_files")
-    .select("id, upload_status")
+    .select("id, upload_status, candidate_name, candidate_phone, candidate_email")
     .eq("id", fileId)
     .single();
 
@@ -26,6 +26,21 @@ export async function POST(_: Request, context: RouteContext) {
 
   if (cvFile.upload_status === "ready") {
     return NextResponse.json({ success: true, uploadStatus: "ready" });
+  }
+
+  if (
+    !cvFile.candidate_name ||
+    !cvFile.candidate_phone ||
+    !cvFile.candidate_email
+  ) {
+    return NextResponse.json(
+      {
+        success: false,
+        uploadStatus: cvFile.upload_status,
+        error: "Contact details must be completed before CV processing starts.",
+      },
+      { status: 400 },
+    );
   }
 
   try {
