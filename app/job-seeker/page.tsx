@@ -50,7 +50,7 @@ const initialMessages: ChatMessage[] = [
   {
     id: "job-seeker-welcome",
     sender: "assistant",
-    text: "Upload your CV or CV image, then I will ask for your name, phone number, and email.",
+    text: "Thank you for your interest. To begin, please tell me your full name.",
   },
 ];
 
@@ -79,7 +79,7 @@ function formatBytes(bytes: number) {
 
 function statusText(file: LocalFile) {
   if (file.status === "ready") return "Ready";
-  if (file.status === "uploaded") return "Waiting for details";
+  if (file.status === "uploaded") return "Uploaded";
   if (file.status === "processing") return "Processing";
   if (file.status === "uploading") return "Uploading";
   return file.error ?? "Upload failed";
@@ -146,13 +146,11 @@ export default function JobSeekerChat() {
   const [isUploading, setIsUploading] = useState(false);
   const [isReplying, setIsReplying] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [confirmedContact, setConfirmedContact] = useState<ContactDetails | null>(null);
 
-  // Tracks which cv_files row the current conversation is about.
-  // Set when upload succeeds, used when sending messages and saving contact details.
-  const [activeFileId, setActiveFileId] = useState<string | null>(null);
-
-  // Holds confirmed contact details while waiting for user to say yes/no.
-  const [pendingContact, setPendingContact] = useState<ContactDetails | null>(null);
+  const hasConfirmedContact = Boolean(
+    confirmedContact?.name && confirmedContact.phone && confirmedContact.email,
+  );
 
   async function readJsonSafely(response: Response) {
     const contentType = response.headers.get("content-type") ?? "";
@@ -170,19 +168,6 @@ export default function JobSeekerChat() {
       return { error: responseText };
     }
   }
-
-  useEffect(() => {
-    const processingFiles = localFiles.filter((file) => file.status === "processing");
-    if (processingFiles.length === 0) return;
-
-    const intervalId = window.setInterval(() => {
-      processingFiles.forEach((file) => {
-        void refreshFileStatus(file.id);
-      });
-    }, 3000);
-
-    return () => window.clearInterval(intervalId);
-  }, [localFiles]);
 
   async function refreshFileStatus(fileId: string) {
     try {
@@ -259,6 +244,19 @@ export default function JobSeekerChat() {
     }
   }
 
+  useEffect(() => {
+    const processingFiles = localFiles.filter((file) => file.status === "processing");
+    if (processingFiles.length === 0) return;
+
+    const intervalId = window.setInterval(() => {
+      processingFiles.forEach((file) => {
+        void refreshFileStatus(file.id);
+      });
+    }, 3000);
+
+    return () => window.clearInterval(intervalId);
+  }, [localFiles]);
+
   async function startBackgroundProcessing(fileId: string) {
     try {
       const response = await fetch(`/api/uploads/${fileId}/process`, {
@@ -303,6 +301,17 @@ export default function JobSeekerChat() {
   async function uploadFiles(selectedFiles: File[]) {
     if (selectedFiles.length === 0) return;
 
+    if (!hasConfirmedContact || !confirmedContact) {
+      setMessages((current) => [
+        ...current,
+        makeMessage(
+          "assistant",
+          "Please confirm your full name, phone number, and email before uploading your CV.",
+        ),
+      ]);
+      return;
+    }
+
     const unsupportedFiles = selectedFiles.filter((file) => !isSupportedCvFile(file));
 
     if (unsupportedFiles.length > 0) {
@@ -335,6 +344,10 @@ export default function JobSeekerChat() {
 
     try {
       const formData = new FormData();
+      formData.append("candidateName", confirmedContact.name ?? "");
+      formData.append("candidatePhone", confirmedContact.phone ?? "");
+      formData.append("candidateEmail", confirmedContact.email ?? "");
+
       selectedFiles.forEach((file) => {
         const normalizedFile = normalizeUploadFile(file);
         formData.append("files", normalizedFile, normalizedFile.name);
@@ -363,14 +376,6 @@ export default function JobSeekerChat() {
         ]);
         return;
       }
-
-      // Store the first uploaded file's Supabase UUID as the active CV.
-      // If multiple files are uploaded at once, we track the first one.
-      const firstUploadedId = payload.files[0]?.id ?? null;
-      setActiveFileId(firstUploadedId);
-
-      // Reset any pending contact details from a previous upload session.
-      setPendingContact(null);
 
       setLocalFiles((current) =>
         current.map((file) => {
@@ -407,20 +412,12 @@ export default function JobSeekerChat() {
         ...current,
         makeMessage(
           "assistant",
-          "Your CV upload is saved. Now I will collect your full name, phone number, and email before processing it.",
+          "Your CV has been uploaded successfully. Thank you for applying for the position.",
         ),
       ]);
 
-      // Kick off the AI conversation now that we have a file ID.
-      // Pass the upload event as the first user turn so Gemini has context.
-      await sendToAI(
-        [
-          {
-            role: "user",
-            content: "I just uploaded my CV.",
-          },
-        ],
-        firstUploadedId,
+      await Promise.all(
+        payload.files.map((file) => startBackgroundProcessing(file.id)),
       );
     } catch (error) {
       const errorMessage =
@@ -447,17 +444,14 @@ export default function JobSeekerChat() {
   // Core function that calls the chat API and handles the response.
   async function sendToAI(
     history: Array<{ role: "user" | "assistant"; content: string }>,
-    fileId: string | null,
   ) {
-    if (!fileId) return;
-
     setIsReplying(true);
 
     try {
       const response = await fetch("/api/job-seeker-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, cvFileId: fileId }),
+        body: JSON.stringify({ messages: history }),
       });
 
       const data = (await response.json()) as {
@@ -485,14 +479,12 @@ export default function JobSeekerChat() {
         makeMessage("assistant", replyText),
       ]);
 
-      // If Claude has all details and is asking the user to confirm, hold them in state.
       if (data.action === "confirm" && data.contactDetails) {
-        setPendingContact(data.contactDetails);
+        setConfirmedContact(null);
       }
 
-      // If user confirmed and Claude says save, write to the database.
       if (data.action === "save" && data.contactDetails) {
-        await saveContactDetails(data.contactDetails, fileId);
+        setConfirmedContact(data.contactDetails);
       }
     } catch {
       setMessages((current) => [
@@ -501,62 +493,6 @@ export default function JobSeekerChat() {
       ]);
     } finally {
       setIsReplying(false);
-    }
-  }
-
-  async function saveContactDetails(details: ContactDetails, fileId: string) {
-    try {
-      const response = await fetch("/api/job-seeker-chat/save-contact", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cvFileId: fileId,
-          name: details.name,
-          phone: details.phone,
-          email: details.email,
-        }),
-      });
-
-      const data = (await response.json()) as { success?: boolean; error?: string };
-
-      if (!response.ok || !data.success) {
-        setMessages((current) => [
-          ...current,
-          makeMessage(
-            "assistant",
-            `I couldn't save your details: ${data.error ?? "unknown error"}. Please try again.`,
-          ),
-        ]);
-        return;
-      }
-
-      // Clear pending contact now that save succeeded.
-      setPendingContact(null);
-      setLocalFiles((current) =>
-        current.map((file) =>
-          file.id === fileId
-            ? { ...file, status: "processing", error: undefined }
-            : file,
-        ),
-      );
-
-      setMessages((current) => [
-        ...current,
-        makeMessage(
-          "assistant",
-          "All done! Your contact details have been saved. I am processing your CV now.",
-        ),
-      ]);
-
-      await startBackgroundProcessing(fileId);
-    } catch {
-      setMessages((current) => [
-        ...current,
-        makeMessage(
-          "assistant",
-          "I couldn't save your details due to a network error. Please try again.",
-        ),
-      ]);
     }
   }
 
@@ -574,10 +510,10 @@ export default function JobSeekerChat() {
     // We reconstruct from current messages plus the new user turn.
     const history = buildHistory([...messages, userMessage]);
 
-    await sendToAI(history, activeFileId);
+    await sendToAI(history);
   }
 
-  // Converts ChatMessage[] into the format the Anthropic API expects.
+  // Converts ChatMessage[] into the format the Gemini API expects.
   // Filters out the initial welcome message (which has no matching assistant role).
   function buildHistory(
     msgs: ChatMessage[],
@@ -622,6 +558,17 @@ export default function JobSeekerChat() {
     event.preventDefault();
     setIsDraggingFile(false);
 
+    if (!hasConfirmedContact) {
+      setMessages((current) => [
+        ...current,
+        makeMessage(
+          "assistant",
+          "Please confirm your contact details before uploading your CV.",
+        ),
+      ]);
+      return;
+    }
+
     const droppedFiles = Array.from(event.dataTransfer.files);
     if (droppedFiles.length === 0) return;
 
@@ -652,7 +599,9 @@ export default function JobSeekerChat() {
       {isDraggingFile ? (
         <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-[#212121]/75">
           <div className="rounded-2xl border border-[#10a37f] bg-[#283f39] px-6 py-4 text-sm font-medium text-white shadow-2xl">
-            Drop PDF, DOCX, or CV image to upload
+            {hasConfirmedContact
+              ? "Drop PDF, DOCX, or CV image to upload"
+              : "Confirm your contact details first"}
           </div>
         </div>
       ) : null}
@@ -742,10 +691,10 @@ export default function JobSeekerChat() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={isUploading || isReplying}
+              disabled={isUploading || isReplying || !hasConfirmedContact}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xl text-zinc-200 hover:bg-white/10 disabled:opacity-50"
               aria-label="Upload CV"
-              title="Upload CV"
+              title={hasConfirmedContact ? "Upload CV" : "Confirm contact details first"}
             >
               +
             </button>
@@ -755,7 +704,7 @@ export default function JobSeekerChat() {
               accept=".pdf,.docx,.png,.jpg,.jpeg,.webp"
               className="hidden"
               onChange={handleUpload}
-              disabled={isUploading || isReplying}
+              disabled={isUploading || isReplying || !hasConfirmedContact}
             />
             <textarea
               rows={1}
@@ -764,9 +713,9 @@ export default function JobSeekerChat() {
               onChange={(event) => setPrompt(event.target.value)}
               disabled={isReplying}
               placeholder={
-                activeFileId
-                  ? "Reply here..."
-                  : "Upload a CV to get started"
+                hasConfirmedContact
+                  ? "Upload your CV or reply here..."
+                  : "Reply with your contact details..."
               }
               className="max-h-36 min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-6 text-zinc-100 outline-none placeholder:text-zinc-500 disabled:opacity-60"
             />
